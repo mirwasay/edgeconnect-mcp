@@ -1236,6 +1236,10 @@ class SectionGapTests(unittest.TestCase):
         series = m["sections"]["paths-trend"]["chart"]["series"]
         self.assertEqual(series[0][0], "branch-a to_hub")
         self.assertEqual([round(v, 1) for _, v in series[0][1]], [1.0, 0.0])
+        self.assertEqual(m["sections"]["paths-trend"]["status"], "amber")  # worst hour 1%: between the 0.1% and 1% loss limits
+        spiky = {"column_def": COLS, "data": [[3600, 0, 0, 900, 100], [7200, 0, 0, 3, 7]]}  # 90% loss: red; 3 of 10 packets: too few to judge, left out
+        m2 = report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, path_trends=[{"appliance": "a", "tunnel": "t", "rows": spiky}]))
+        self.assertEqual(([round(v) for _, v in m2["sections"]["paths-trend"]["chart"]["series"][0][1]], m2["sections"]["paths-trend"]["status"]), ([90], "red"))
         self.assertEqual([(r["dscp"], r["share_pct"]) for r in m["sections"]["paths-dscp"]["table"]], [("0 (be)", 60.0), ("46 (ef)", 40.0)])
 
     def test_qos_drops_per_class(self):

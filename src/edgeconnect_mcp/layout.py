@@ -161,7 +161,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
         parts.append('<line class="grid" x1="{0}" x2="{1}" y1="{2:.1f}" y2="{2:.1f}"/><text class="axis" x="{3}" y="{4:.1f}" text-anchor="end">{5}</text>'.format(
             x0, x1, sy(v), x0 - 6, sy(v) + 4, tick))
     every = max(1, len(labels) // 8)
-    parts += ['<text class="axis" x="{:.1f}" y="{}" text-anchor="middle">{}</text>'.format(sx(i), y0 + 18, esc(l)) for i, l in enumerate(labels) if i % every == 0]
+    parts += ['<text class="axis" x="{:.1f}" y="{}" text-anchor="{}">{}</text>'.format(sx(i), y0 + 18, "end" if i == len(labels) - 1 else "middle", esc(l))
+              for i, l in enumerate(labels) if i % every == 0]  # the last label ends at the axis, not past it
     if threshold is not None:
         parts.append('<line class="threshold" x1="{0}" x2="{1}" y1="{2:.1f}" y2="{2:.1f}"/><text class="axis" x="{1}" y="{3:.1f}" text-anchor="end">threshold {4:g}{5}</text>'.format(
             x0, x1, sy(threshold), sy(threshold) - 5, threshold, esc(unit)))

@@ -971,7 +971,8 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     shown = [v for _, v, _, _ in items if v is not None]
     sections["avail-summary"] = {"status": availability_status, "metrics": [m_fleet, "overlay_avail_pct", "underlay_avail_pct", "alarms_critical", "appliances_total"],
                                  "chart": {"kind": "bullets", "title": "Availability against target", "items": items,
-                                           "low": min([90.0] + shown + [min(lim) for _, _, _, lim in items]), "high": 100.0}}
+                                           # zoomed to just below the lowest value or limit, so 99.5 and 99.9 are visibly apart
+                                           "low": max(0.0, math.floor(min(shown + [min(lim) for _, _, _, lim in items]) * 2) / 2 - 0.5), "high": 100.0}}
     return sections
 
 
@@ -1065,11 +1066,14 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                                     "metrics": [], "table": t_rows, "notes": ["Underlay paths only, grouped by the transport labels at the end of the tunnel name; medians across the paths."]}}
     series = []
     for t in ctx["data"].get("path_trends") or []:
+        # An hour with under 100 packets gives a loss % that means little (a few lost probes read as 30%), so it is left out.
         points = [[_bucket_label(r["TIMESTAMP"], 2 * 86400), 100.0 * float(r.get("POST_LOSS") or 0) / (float(r.get("WRX_PKTS") or 0) + float(r.get("POST_LOSS") or 0))]
-                  for r in _columns(t.get("rows")) if isinstance(r.get("TIMESTAMP"), (int, float)) and (r.get("WRX_PKTS") or r.get("POST_LOSS"))]
+                  for r in _columns(t.get("rows")) if isinstance(r.get("TIMESTAMP"), (int, float)) and float(r.get("WRX_PKTS") or 0) + float(r.get("POST_LOSS") or 0) >= 100]
         if points:
             series.append(["{} {}".format(t["appliance"], t["tunnel"]), sorted(points)])
-    sections["paths-trend"] = {"status": "green" if series else "grey", "metrics": [], "notes": ["The three paths with the most loss after FEC, hour by hour."],
+    peak = max([v for _, pts in series for _, v in pts], default=None)
+    sections["paths-trend"] = {"status": "grey" if peak is None else band(peak, loss, higher_is_better=False), "metrics": [],
+                               "notes": ["The three paths with the most loss after FEC, hour by hour; hours with under 100 packets are left out. Status: the worst hour against the loss limits."],
                                "chart": {"kind": "line", "title": "Loss after FEC, % per hour", "unit": "%", "threshold": max(loss), "series": series[:3]} if series else {}}
     by_dscp: Dict[str, int] = {}
 
