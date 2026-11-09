@@ -321,11 +321,17 @@ def _collect_capacity(c: Collector, nepks: List[str], start_s: int, end_s: int, 
     basis = {"granularity": "hour", "from": hourly_from, "to": end_s} if hourly_from < end_s else {"granularity": "day", "from": start_s, "to": end_s}
     c.data["capacity_basis"] = dict(basis, retention_known=kept is not None)
     totals = c.call("interface_totals", "/stats/aggregate/interface", {"startTime": start_s, "endTime": end_s, "granularity": "day", "trafficType": "all_traffic"}, {"nePks": nepks})
+    if totals is not None:  # the same totals for the period before, for the change in average load
+        c.call("interface_totals_previous", "/stats/aggregate/interface", {"startTime": 2 * start_s - end_s, "endTime": start_s, "granularity": "day", "trafficType": "all_traffic"},
+               {"nePks": nepks})
     if totals is None:  # GET-only, or the POST was refused: the overlay transport stats mark WAN-side interfaces (last day only)
         for ne in nepks:
             c.call("wan_side:" + ne, "/stats/timeseries/interfaceOverlay", {"nePk": ne, "startTime": end_s - 86400, "endTime": end_s, "granularity": "day"})
     c.data["capacity_top"] = top
-    for link in wan_links(c.data, nepks)[:top or None]:  # every link unless --top limits it to the busiest
+    links = wan_links(c.data, nepks)
+    for ne in dict.fromkeys(link["nePk"] for link in links):  # what drives a busy link: its appliance's largest applications
+        c.call("apps:" + ne, "/stats/aggregate/application2", {"nePk": ne, "startTime": start_s, "endTime": end_s, "top": 10})
+    for link in links[:top or None]:  # every link unless --top limits it to the busiest
         c.call("hourly:{}:{}".format(link["nePk"], link["interface"]), "/stats/timeseries/interface",
                {"nePk": link["nePk"], "startTime": basis["from"], "endTime": basis["to"], "granularity": basis["granularity"], "trafficType": "all_traffic", "interfaceName": link["interface"]})
 
@@ -1269,6 +1275,14 @@ def metrics_status(ctx: Dict[str, Any], mid: str) -> str:
     return ctx["metrics"][mid].get("status") or "grey"
 
 
+def _drivers(rows: Any, count: int = 3) -> str:
+    """The appliance's largest applications with their share of its WAN traffic, e.g. "Backup 60%, Zoom 30%"."""
+    rows = rows if isinstance(rows, list) else []
+    total = sum(_wan(r, "SUM_WTX_BYTES", "SUM_WRX_BYTES") for r in rows if r.get("APPNAME") == "__total__")
+    named = sorted((r for r in rows if r.get("APPNAME") != "__total__"), key=lambda r: -_wan(r, "SUM_WTX_BYTES", "SUM_WRX_BYTES"))[:count]
+    return ", ".join("{} {:.0f}%".format(r.get("APPNAME"), 100.0 * _wan(r, "SUM_WTX_BYTES", "SUM_WRX_BYTES") / total) for r in named) if total else ""
+
+
 def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     data, names, metric, gaps = ctx["data"], ctx["names"], ctx["metric"], ctx["gaps"]
     links = wan_links(data, names)
@@ -1277,11 +1291,17 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if not basis.get("retention_known"):
         gaps.append("Capacity: hourly retention not readable from GET /gms/stats/retention; {:g} days assumed.".format(HOURLY_RETENTION / 86400))
     limits = health_limits(data, "bwUtilization", gaps) if links else DEFAULT_HEALTH["bwUtilization"]
+    before = {(l["nePk"], l["interface"]): max(l["avg_tx_pct"] or 0, l["avg_rx_pct"] or 0) for l in wan_links({"interface_totals": data.get("interface_totals_previous")}, names)} \
+        if isinstance(data.get("interface_totals_previous"), list) else {}
     rows = []
     for link in links:
         hourly = data.get("hourly:{}:{}".format(link["nePk"], link["interface"]))
         tx, rx = [], []
+        by_hour: Dict[int, List[float]] = {}
         for row in hourly if isinstance(hourly, list) else []:
+            if bucket == 3600 and isinstance(row.get("timestamp"), (int, float)):
+                load = [_util(float(row.get(k) or 0), bucket, float(row.get(b) or 0)) for k, b in (("tx_bytes", "max_bw_tx"), ("rx_bytes", "max_bw_rx"))]
+                by_hour.setdefault(int(row["timestamp"]) // 3600 % 24, []).append(max([v for v in load if v is not None], default=0.0))
             # Each hourly row carries the configured bandwidth (kbps) at that time.
             for values, key, bw in ((tx, "tx_bytes", "max_bw_tx"), (rx, "rx_bytes", "max_bw_rx")):
                 pct = _util(float(row.get(key) or 0), bucket, float(row.get(bw) or 0))
@@ -1289,10 +1309,15 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                     values.append(pct)
         p95_tx, p95_rx = _p95(tx), _p95(rx)
         peak = max([v for v in (p95_tx, p95_rx) if v is not None], default=None)
+        peak_hour = max(sorted(by_hour), key=lambda h: statistics.mean(by_hour[h])) if by_hour else None
+        now_avg = max(link["avg_tx_pct"] or 0, link["avg_rx_pct"] or 0)
+        status = _load_status(peak, limits)
         rows.append({"appliance": names.get(link["nePk"], link["nePk"]), "interface": link["interface"], "label": link["label"],
                      "outbound_mbps": round(link["bw_tx"] / 1000, 1), "inbound_mbps": round(link["bw_rx"] / 1000, 1),
                      "avg_out_pct": link["avg_tx_pct"], "avg_in_pct": link["avg_rx_pct"], "p95_out_pct": p95_tx, "p95_in_pct": p95_rx,
-                     "buckets": max(len(tx), len(rx)), "status": _load_status(peak, limits)})
+                     "buckets": max(len(tx), len(rx)), "peak_hour_utc": "{:02d}:00".format(peak_hour) if peak_hour is not None else None,
+                     "avg_change_pts": round(now_avg - before[(link["nePk"], link["interface"])], 2) if (link["nePk"], link["interface"]) in before else None,
+                     "top_applications": _drivers(data.get("apps:" + str(link["nePk"]))) if status in ("amber", "red") else "", "status": status})
     measured = [r for r in rows if r["status"] != "grey"]
     flagged = [r for r in measured if r["status"] in ("amber", "red")]
     worst_p95 = max([max(v for v in (r["p95_out_pct"], r["p95_in_pct"]) if v is not None) for r in measured], default=None)
