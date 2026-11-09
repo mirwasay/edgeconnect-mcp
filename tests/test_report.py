@@ -14,7 +14,8 @@ PATHS = ["/gms/versions", "/appliance", "/stats/config/availabilityThreshold", "
          "/stats/aggregate/availability/tunnel", "/health/alarmPeriodSummary", "/alarm/summary", "/gmsLicense", "/license/portal/summary",
          "/alarm/count/appliance", "/gms/stats/nonStatsTable/retention", "/maintenanceMode", "/tunnels2/physical", "/tunnels2/bonded",
          "/stats/timeseries/interfaceOverlay", "/stats/timeseries/interface", "/license/portal/appliance", "/appliance/backup",
-         "/health/healthThresholdConfig", "/stats/aggregate/tunnel", "/action", "/stats/timeseries/availability/appliance", "/alarm/correlatedAlarms"]
+         "/health/healthThresholdConfig", "/stats/aggregate/tunnel", "/action", "/stats/timeseries/availability/appliance", "/alarm/correlatedAlarms",
+         "/stats/aggregate/availability/interface"]
 POSTS = ["/alarm/appliance", "/health", "/stats/aggregate/interface"]
 SPEC = {"swagger": "2.0", "basePath": "/gms/rest", "paths": dict({p: {"get": {"summary": p}} for p in PATHS}, **{p: {"post": {"summary": p}} for p in POSTS})}
 APPLIANCES = [{"nePk": "1.NE", "hostName": "branch-a", "state": 1, "model": "EC-V", "softwareVersion": "9.6.2.1_1", "serial": "SN-0001"},
@@ -851,7 +852,7 @@ class LayoutTests(unittest.TestCase):
         marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
                  'data-section-id="avail-summary"', "<footer>"]
         self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
-        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # the title is the message
+        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # appliances, tunnels, alarms and the summary  # the title is the message
         self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
         self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
 
@@ -1047,6 +1048,83 @@ class SummaryReportTests(unittest.TestCase):
         m = report.compute(phase2_bundle("operations", active_alarms=[{"applianceId": "1.NE", "severity": "MAJOR"}]))
         self.assertEqual([sid for sid in m["sections"]], [sid for sid, _ in report.SECTIONS["operations"]])
         self.assertEqual(m["sections"]["ops-alarms"]["status"], "amber")
+
+
+class MoreReportTests(unittest.TestCase):
+    """R6 optimisation, R7 security, R8 change and alarm activity."""
+
+    def test_optimisation_reduction_per_appliance(self):
+        flows = {"OPTIMIZED_TRAFFIC": {"TCP_ACCELERATED": {"1.NE": {"nePk": "1.NE", "SUM_LRX_BYTES": 1000, "SUM_WTX_BYTES": 400, "SUM_WRX_BYTES": 100, "SUM_LTX_BYTES": 300}},
+                                       "NON_TCP": {"1.NE": {"nePk": "1.NE", "SUM_LRX_BYTES": 0, "SUM_WTX_BYTES": 0, "SUM_WRX_BYTES": 0, "SUM_LTX_BYTES": 0}}}}
+        m = report.compute(phase2_bundle("optimisation", **{"flows:1.NE": flows}))
+        row = m["sections"]["opt-appliances"]["table"][0]
+        self.assertEqual((row["appliance"], row["lan_bytes"], row["wan_bytes"], row["saved_bytes"], row["reduction_pct"]), ("branch-a", 1300, 500, 800, 61.538))
+        self.assertEqual(m["metrics"]["opt_reduction_pct"]["value"], 61.538)
+
+    def test_security_drops_per_zone_pair(self):
+        rows = [{"nePk": "1.NE", "fromZone": "1", "toZone": "2", "flows_allowed": 90, "flows_dropped": 10, "policy_drop_pkts": 7, "routing_drop_pkts": 3}]
+        m = report.compute(phase2_bundle("security", zones={"1": {"name": "TRUSTED"}, "2": {"name": "GUEST"}}, **{"security:1.NE": rows}))
+        row = m["sections"]["sec-pairs"]["table"][0]
+        self.assertEqual((row["from_zone"], row["to_zone"], row["flows_dropped"], row["dropped_pct"]), ("TRUSTED", "GUEST", 10, 10.0))
+        self.assertEqual(m["metrics"]["sec_flows_dropped"]["value"], 10)
+
+    def test_activity_changes_repeat_alarms_and_alarms_after_a_change(self):
+        hour = 3600000
+        audit = [{"id": 1, "user": "admin", "name": "Apply Appliance Template", "nepk": "1.NE", "queuedTime": 10 * hour, "completionStatus": True},
+                 {"id": 2, "user": "admin", "name": "Reboot", "nepk": "1.NE", "queuedTime": 20 * hour, "completionStatus": False}]
+        alarm = lambda i, t, sev="MAJOR", ne="1.NE", name="Tunnel down": {"id": i, "applianceId": ne, "severity": sev, "name": name, "timeOccurredInMills": t,
+                                                                          "clearedTimeInMills": t + hour}
+        alarms = [alarm(1, 10 * hour + 60000), alarm(2, 30 * hour), alarm(3, 40 * hour), alarm(4, 50 * hour, "CRITICAL", "2.NE", "Disk")]
+        m = report.compute(phase2_bundle("activity", activity_audit=audit, activity_alarms=alarms))
+        self.assertEqual((m["metrics"]["act_changes"]["value"], m["metrics"]["act_changes_failed"]["value"], m["metrics"]["act_alarms"]["value"]), (2, 1, 4))
+        self.assertEqual([(r["change"], r["times"], r["failed"]) for r in m["sections"]["act-changes"]["table"]], [("Reboot", 1, 1), ("Apply Appliance Template", 1, 0)])
+        self.assertEqual(m["sections"]["act-repeat"]["table"][0], {"appliance": "branch-a", "alarm": "Tunnel down", "times": 3})
+        self.assertEqual([r["alarm"] for r in m["sections"]["act-after-change"]["table"]], ["Tunnel down"])  # raised within an hour of a change on the same appliance
+
+    def test_activity_pages_back_through_a_full_audit_log(self):
+        class Paged(RoutedClient):
+            def request(self, method, path, **kwargs):
+                if path == "/action":
+                    self.calls.append((method, path, kwargs.get("query"), None))
+                    until = kwargs["query"]["endTime"]
+                    size = report.AUDIT_PAGE if sum(c[1] == "/action" for c in self.calls) < 3 else 5  # two full pages, then a short one
+                    page = [{"id": until - i, "queuedTime": until - i, "user": "u", "name": "n", "nepk": "1.NE"} for i in range(size)]
+                    return json.dumps(page).encode()
+                return super().request(method, path, **kwargs)
+        client = Paged({"/gms/versions": {}, "/appliance": APPLIANCES})
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(SPEC))
+            orchestrator = Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)
+            b = report.collect(Server({"lab": orchestrator}, default="lab", log=lambda line: None), "lab", "activity", now=datetime(2026, 9, 21, tzinfo=timezone.utc),
+                               history_root=Path(tmp) / "h")
+        pages = [c[2] for c in client.calls if c[1] == "/action"]
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(pages[1]["endTime"], pages[0]["endTime"] - report.AUDIT_PAGE)  # the next page ends just before the oldest entry read
+        self.assertEqual((len(pages), len(b["data"]["activity_audit"])), (3, 2 * report.AUDIT_PAGE + 5))
+        self.assertFalse(b["data"]["activity_audit_full"])
+
+    def test_new_reports_default_to_the_last_7_days(self):
+        self.assertEqual([report.DEFAULT_PERIOD[r] for r in ("optimisation", "security", "activity")], ["last-7-days"] * 3)
+
+
+class AvailabilityReworkTests(unittest.TestCase):
+    """Availability adds interfaces (WAN ports) and a hub / branch roll-up."""
+
+    def test_interfaces_and_roles(self):
+        apps = [dict(APPLIANCES[0], networkRole="1"), dict(APPLIANCES[1], networkRole="0")]
+        ifaces = [{"nepk": "1.NE", "ifname": "wan0", "label": "INETA", "state": 600, "count": 1000}, {"nepk": "1.NE", "ifname": "lan0", "label": "none", "state": 0, "count": 1000}]
+        b = bundle(appliances=apps, **{"ifavail:1.NE": ifaces})
+        b["data"]["availability_threshold"]["interfaceAvailability"] = {"goodLimit": 99.0, "okLimit": 99.9}
+        m = report.compute(b)
+        rows = {r["interface"]: (r["availability_pct"], r["status"]) for r in m["sections"]["avail-interfaces"]["table"]}
+        self.assertEqual(rows, {"wan0": (99.0, "amber"), "lan0": (100.0, "green")})  # 600 s down of 1,000 minutes
+        ifaces.append({"nepk": "1.NE", "ifname": "lan1", "label": "none", "state": 59900, "count": 1000})  # up 0.2% of the period: an unused port
+        m = report.compute(bundle(appliances=apps, **{"ifavail:1.NE": ifaces}))
+        self.assertNotIn("lan1", [r["interface"] for r in m["sections"]["avail-interfaces"]["table"]])
+        self.assertEqual(m["metrics"]["interfaces_unused"]["value"], 1)
+        roles = {r["role"]: r["reachability_pct"] for r in m["sections"]["avail-roles"]["table"]}
+        self.assertEqual(roles, {"hub": 99.5, "branch": 100.0})
 
 
 class HealthByCategoryTests(unittest.TestCase):
