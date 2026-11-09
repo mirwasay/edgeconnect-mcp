@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -15,7 +16,8 @@ PATHS = ["/gms/versions", "/appliance", "/stats/config/availabilityThreshold", "
          "/alarm/count/appliance", "/gms/stats/nonStatsTable/retention", "/maintenanceMode", "/tunnels2/physical", "/tunnels2/bonded",
          "/stats/timeseries/interfaceOverlay", "/stats/timeseries/interface", "/license/portal/appliance", "/appliance/backup",
          "/health/healthThresholdConfig", "/stats/aggregate/tunnel", "/action", "/stats/timeseries/availability/appliance", "/alarm/correlatedAlarms",
-         "/stats/aggregate/availability/interface"]
+         "/stats/aggregate/availability/interface", "/gms/overlays/config", "/stats/aggregate/application2", "/stats/aggregate/boost", "/stats/aggregate/dscp",
+         "/stats/timeseries/tunnel", "/stats/timeseries/appliance", "/stats/timeseries/shaper", "/stats/aggregate/flow", "/stats/aggregate/securityPolicy", "/zones"]
 POSTS = ["/alarm/appliance", "/health", "/stats/aggregate/interface"]
 SPEC = {"swagger": "2.0", "basePath": "/gms/rest", "paths": dict({p: {"get": {"summary": p}} for p in PATHS}, **{p: {"post": {"summary": p}} for p in POSTS})}
 APPLIANCES = [{"nePk": "1.NE", "hostName": "branch-a", "state": 1, "model": "EC-V", "softwareVersion": "9.6.2.1_1", "serial": "SN-0001"},
@@ -59,7 +61,7 @@ class ComputeTests(unittest.TestCase):
         m = report.compute(bundle())
         self.assertEqual(m["metrics"]["fleet_reach_pct"]["value"], 99.75)
         self.assertEqual(m["metrics"]["fleet_reach_pct"]["status"], "amber")  # between 99.0 and 99.9
-        rows = {r["nePk"]: (r["value"], r["status"]) for r in m["sections"]["avail-appliances"]["table"]}
+        rows = {r["nePk"]: (r["reachability_pct"], r["status"]) for r in m["sections"]["avail-appliances"]["table"]}
         self.assertEqual(rows, {"1.NE": (99.5, "amber"), "2.NE": (100.0, "green")})
 
     def test_tunnel_availability_is_downtime_seconds_over_sample_minutes(self):
@@ -325,7 +327,7 @@ class Phase2CollectTests(CollectTests):
     def test_capacity_get_only_finds_wan_links_from_overlay_stats_then_reads_hourly(self):
         client = RoutedClient(self.answers())
         report.collect(self.server(client, get_only=True), "lab", "capacity", "2026-09", now=datetime(2026, 9, 21, tzinfo=timezone.utc))
-        paths = [(c[0], c[1], (c[2] or {}).get("interfaceName"), (c[2] or {}).get("granularity")) for c in client.calls if c[1].startswith("/stats")]
+        paths = [(c[0], c[1], (c[2] or {}).get("interfaceName"), (c[2] or {}).get("granularity")) for c in client.calls if "/interface" in c[1]]  # links, not apps or QoS
         self.assertEqual(paths, [("GET", "/stats/timeseries/interfaceOverlay", None, "day"), ("GET", "/stats/timeseries/interfaceOverlay", None, "day"),
                                  ("GET", "/stats/timeseries/interface", "wan0", "hour")])
         hourly = [c for c in client.calls if c[1] == "/stats/timeseries/interface"][0][2]
@@ -334,7 +336,7 @@ class Phase2CollectTests(CollectTests):
     def test_capacity_uses_the_totals_post_and_the_top_n(self):
         client = RoutedClient(self.answers())
         report.collect(self.server(client, get_only=False), "lab", "capacity", "2026-09", top=1, now=datetime(2026, 9, 21, tzinfo=timezone.utc))
-        self.assertEqual([(c[0], c[1], (c[2] or {}).get("interfaceName")) for c in client.calls if c[1].startswith("/stats")],
+        self.assertEqual([(c[0], c[1], (c[2] or {}).get("interfaceName")) for c in client.calls if "/interface" in c[1]],
                          [("POST", "/stats/aggregate/interface", None), ("POST", "/stats/aggregate/interface", None), ("GET", "/stats/timeseries/interface", "wan0")])  # period, previous period
 
     def test_noc_and_lifecycle_requests(self):
@@ -852,7 +854,7 @@ class LayoutTests(unittest.TestCase):
         marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
                  'data-section-id="avail-summary"', "<footer>"]
         self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
-        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # appliances, tunnels, alarms and the summary  # the title is the message
+        self.assertIn("<h1>Availability report, 2026-10: 5 areas need attention</h1>", page)  # summary, appliances, tunnels, transports, alarms  # the title is the message
         self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
         self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
 
@@ -1168,6 +1170,136 @@ class ConsistencyTests(unittest.TestCase):
         two = {"report": "noc", "sections": {"noc-health": {"text": "Only {{m:health_mos_good_24h_pct}} of hours had a good MOS rating."}}}
         strip = lambda page: re.sub(r'<p class="summary">.*?</p>', "", page)
         self.assertEqual(strip(report.render(m1, one)), strip(report.render(m2, two)))
+
+
+class LayoutGapTests(unittest.TestCase):
+    """Gaps from verification.md: bullet graph, line chart, follow-up links, number formats."""
+
+    def test_bullet_graph_shows_value_target_and_bands(self):
+        svg = layout.bullets("Availability against target", [("Appliance reachability", 99.5, 99.9, (99.0, 99.9))], 99.0, 100.0)
+        self.assertIn("Appliance reachability: 99.500% (target 99.900%)", svg)
+        self.assertEqual((svg.count('class="band'), svg.count('class="target"')), (3, 1))
+
+    def test_line_chart_has_one_axis_a_legend_and_at_most_three_series(self):
+        series = [("this", [("00", 1.0), ("01", 3.0)]), ("that", [("00", 2.0), ("01", 2.0)])]
+        svg = layout.line("Load by hour", series, "%", threshold=80.0)
+        self.assertEqual(svg.count("<polyline"), 2)
+        self.assertIn("threshold 80", svg)
+        self.assertIn('class="legend"', svg)
+        with self.assertRaises(ValueError):
+            layout.line("x", series * 2, "%")
+
+    def test_next_links_and_number_formats(self):
+        page = report.render(report.compute(bundle()))
+        self.assertIn('<nav class="next"', page)
+        self.assertIn("<td class=\"n\">99.500</td>", page)  # availability to 3 decimals
+        self.assertEqual(layout.table([{"loss_pct": 1.23456}]).count("1.2<"), 1)  # other percentages to 1 decimal
+
+
+class NetworkHealthTests(unittest.TestCase):
+    """R1 network health: noc, paths and the day's changes and alarms, plus a watch list of what is degraded but not failed."""
+
+    def test_health_report_parts_period_and_watch_list(self):
+        self.assertEqual((report.PARTS["health"], report.DEFAULT_PERIOD["health"]), (("noc", "paths", "activity"), "last-24-hours"))
+        paths = {"t": {"1.NE": {"alias": "to_hub_INET", "overlayid": "0", "SUM_POST_LOSS": 50, "SUM_WRX_PKTS": 99950, "AVG_LATENCY_AVG": 30, "AVG_JITTER": 1, "mos": 430}}}
+        b = phase2_bundle("health", health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
+        b["options"] = {"parts": list(report.PARTS["health"])}
+        b["period"].update(from_ms=0, to_ms=86400000)
+        m = report.compute(b)
+        ids = [sid for sid, _ in m["section_list"]]
+        self.assertEqual(ids[-2:], ["health-watch", "data-gaps"])
+        self.assertIn("act-changes", ids)
+        watch = m["sections"]["health-watch"]["table"]
+        self.assertEqual([(r["what"], r["item"]) for r in watch], [("path between thresholds", "branch-a to_hub_INET")])  # 0.05% loss, 30 ms: amber, not red
+
+
+COLS = ["TIMESTAMP", "WRX_BYTES", "WTX_BYTES", "POST_LOSS", "WRX_PKTS"]
+
+
+class SectionGapTests(unittest.TestCase):
+    """Sections from the API study that verification.md listed as missing."""
+
+    def test_traffic_daily_trend_is_a_line(self):
+        ts = lambda d: {"column_def": COLS, "data": [[86400 * d, 100, 50, 0, 0]]}
+        trend = {"trend:1.NE": {"column_def": COLS, "data": [[0, 100, 50, 0, 0], [86400, 10, 0, 0, 0]]}, "trend:2.NE": ts(0)}
+        b = phase2_bundle("traffic", **trend)
+        b["period"].update(from_ms=0, to_ms=7 * 86400000)  # a week: one point per day
+        chart = report.compute(b)["sections"]["traffic-summary"]["chart"]
+        self.assertEqual((chart["kind"], chart["series"][0][1]), ("line", [["1970-01-01", 300], ["1970-01-02", 10]]))
+
+    def test_worst_path_trends_and_dscp(self):
+        trend = {"column_def": COLS, "data": [[3600, 0, 0, 10, 990], [7200, 0, 0, 0, 1000]]}
+        dscp = {"ALL_TRAFFIC": {"46": {"1.NE": {"nePk": "1.NE", "DSCP": 46, "SUM_WTX_BYTES": 300, "SUM_WRX_BYTES": 100}},
+                                "0": {"1.NE": {"nePk": "1.NE", "DSCP": 0, "SUM_WTX_BYTES": 500, "SUM_WRX_BYTES": 100}}}}
+        b = phase2_bundle("paths", health_threshold=THRESHOLDS, path_trends=[{"appliance": "branch-a", "tunnel": "to_hub", "rows": trend}], **{"dscp:1.NE": dscp})
+        m = report.compute(b)
+        series = m["sections"]["paths-trend"]["chart"]["series"]
+        self.assertEqual(series[0][0], "branch-a to_hub")
+        self.assertEqual([round(v, 1) for _, v in series[0][1]], [1.0, 0.0])
+        self.assertEqual([(r["dscp"], r["share_pct"]) for r in m["sections"]["paths-dscp"]["table"]], [("0 (be)", 60.0), ("46 (ef)", 40.0)])
+
+    def test_qos_drops_per_class(self):
+        shaper = [{"trafficClass": 2, "direction": 0, "totalBytes": 1000, "qosDrops": 10, "otherDrops": 1}, {"trafficClass": 2, "direction": 0, "totalBytes": 1000, "qosDrops": 0, "otherDrops": 0}]
+        m = report.compute(phase2_bundle("capacity", **{"shaper:1.NE": {"data": shaper}}))  # 10.0 wraps the rows in "data"
+        self.assertEqual(m["sections"]["cap-qos"]["table"][0], {"appliance": "branch-a", "traffic_class": 2, "direction": "outbound", "bytes": 2000, "qos_drops": 10, "other_drops": 1})
+
+    def test_optimisation_by_application_and_boost(self):
+        app = {"nePk": "1.NE", "APPNAME": "CIFS", "SUM_LRX_BYTES": 800, "SUM_LTX_BYTES": 200, "SUM_WTX_BYTES": 300, "SUM_WRX_BYTES": 100}
+        m = report.compute(phase2_bundle("optimisation", **{"apps:1.NE": [app]}))
+        self.assertEqual(m["sections"]["opt-apps"]["table"][0], {"application": "CIFS", "lan_bytes": 1000, "wan_bytes": 400, "saved_bytes": 600, "reduction_pct": 60.0})
+        self.assertEqual(m["sections"]["opt-boost"]["status"], "grey")
+
+    def test_availability_per_transport_label_and_overlay_with_bullets(self):
+        b = bundle(overlays=[{"id": 1, "name": "VOICE"}], **{"overlay:1.NE": {"1": [{"overlayid": 1, "count": 1000, "tunnel_state": 600, "blackout": 0, "brownout": 0}],
+                                                                       "0": [{"overlayid": 0, "count": 1000, "tunnel_state": 0, "blackout": 0, "brownout": 0}]},
+                                                     "underlay:1.NE": {"0": [{"overlayid": 0, "label": "INETA", "count": 1000, "tunnel_state": 0, "blackout": 0, "brownout": 0}]}})
+        m = report.compute(b)
+        rows = {(r["kind"], r["name"]): r["availability_pct"] for r in m["sections"]["avail-transport"]["table"]}
+        self.assertEqual(rows, {("overlay", "VOICE"): 99.0, ("transport", "INETA"): 100.0})
+        self.assertEqual(m["sections"]["avail-summary"]["chart"]["kind"], "bullets")
+
+
+class OptionGapTests(unittest.TestCase):
+    """Per-report options from the plan: traffic type, overlay, planning threshold."""
+
+    def test_threshold_sets_the_planning_limit_and_is_printed(self):
+        hourly = [{"tx_bytes": 45000000000 * 60 / 100, "rx_bytes": 0, "max_bw_tx": 100000, "max_bw_rx": 100000}] * 24  # 60% every hour
+        b = phase2_bundle("capacity", interface_totals=CapacityTests.TOTALS, **{"hourly:1.NE:wan0": hourly})
+        self.assertEqual(next(r for r in report.compute(b)["sections"]["cap-links"]["table"] if r["interface"] == "wan0")["status"], "green")
+        b["options"] = {"threshold": 50.0}
+        m = report.compute(b)
+        self.assertEqual(next(r for r in m["sections"]["cap-links"]["table"] if r["interface"] == "wan0")["status"], "amber")
+        self.assertIn("planning limit: 50.0", report.render(m))
+
+    def test_bad_values_are_refused(self):
+        client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(SPEC))
+            server = Server({"lab": Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)}, default="lab", log=lambda l: None)
+            for kwargs in ({"traffic_type": "voice"}, {"threshold": 150.0}):
+                with self.assertRaises(ValueError):
+                    report.collect(server, "lab", "traffic", now=datetime(2026, 9, 21, tzinfo=timezone.utc), **kwargs)
+
+
+GOLDEN = Path(__file__).with_name("golden")
+
+
+class SnapshotTests(unittest.TestCase):
+    """The layout is fixed: these pages must not change unless the golden files are updated on purpose (UPDATE_GOLDEN=1)."""
+
+    def check(self, name, page):
+        path = GOLDEN / (name + ".html")
+        if os.environ.get("UPDATE_GOLDEN"):
+            path.write_text(page, encoding="utf-8")
+        self.assertEqual(page, path.read_text(encoding="utf-8"), "layout changed; if on purpose, rerun with UPDATE_GOLDEN=1 and review the diff")
+
+    def test_availability_page(self):
+        self.check("availability", report.render(report.compute(bundle())))
+
+    def test_noc_page(self):
+        data = {"health:" + c: {"1.NE": HealthByCategoryTests.hours("MAJOR" if c == "MOS" else "HEALTHY")} for c in ("LOSS", "MOS")}
+        self.check("noc", report.render(report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "MAJOR", "description": "d"}], **data))))
 
 
 class HealthByCategoryTests(unittest.TestCase):

@@ -116,7 +116,7 @@ Width is at most 1080 px, centred. Below 1000 px the tiles go to 3 per row, belo
 1. **One renderer in code.** Each block above is one Python function: tile, bullet, bars, line, grid, table, section, frame. Reports only supply data to these functions; no report writes HTML.
 2. **The agent never writes HTML.** Its text is escaped and length-limited, and it can only fill the summary, cause and action slots.
 3. **Fixed order:** the section order, tile order and table columns are defined per report in code.
-4. **Snapshot test:** each report type is rendered from recorded data and compared with a stored golden HTML. Any layout change fails the test until the golden file is updated on purpose.
+4. **Snapshot test:** `tests/golden/` holds stored pages (availability, NOC) rendered from fixed data; any layout change fails `SnapshotTests` until the files are regenerated on purpose with `UPDATE_GOLDEN=1`.
 5. **Self-checks at render time:**
    - no `<script>`
    - no external URL
