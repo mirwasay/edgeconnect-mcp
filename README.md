@@ -182,8 +182,8 @@ edgeconnect-mcp report render rep/metrics.json rep/narrative.json --out rep/repo
 | `--period` | `last-month` (default) or `month-to-date`; or `--month YYYY-MM` |
 | `--scope` | `all` (default), or comma-separated nePks or host names |
 | `--target` | `orchestrator` (default: its configured thresholds), `99.5`, `99.9` or `99.99` |
-| `--down-tunnels` | `include` (default) or `separate` |
-| `--top` | capacity: how many of the busiest WAN links get an hourly P95 read (default 20) |
+| `--down-tunnels` | `separate` (default: listed apart and left out of the figures) or `include` |
+| `--top` | capacity: only the N busiest WAN links get an hourly P95 read (default: every link) |
 | `--from`, `--to` or `--alarm-id` | incident only, and required for it: an ISO window (UTC unless it says otherwise), or one alarm |
 | `--history` | the alarm archive (default `~/.edgeconnect-mcp/history`) |
 | `--dotenv` | the settings file (default `$EDGECONNECT_DOTENV`, else `~/.edgeconnect-mcp/.env`, else `./.env`) |
