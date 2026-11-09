@@ -18,7 +18,7 @@ You ask in plain language ("which appliances on the lab are unreachable?") inste
 - **Every call is audited** to a local JSON-lines log, and optionally to syslog and SQLite.
 - **No dependencies.** Pure Python 3.9+ standard library. Runs over stdio, locally, over SSH or in a container, or as an HTTP endpoint behind an HTTPS proxy.
 - **Current MCP spec.** Speaks MCP 2026-07-28 (stateless, `server/discover`) and still answers older clients that open with `initialize` (2025-11-25 back to 2024-11-05).
-- **Comes with a guide skill** that tells the assistant which official docs and tested operations to use for each feature, and a **report skill** that turns Orchestrator data into one of six reports: availability, NOC digest, WAN capacity, lifecycle, major incident or an executive summary (one HTML file; code computes every number).
+- **Comes with a guide skill** that tells the assistant which official docs and tested operations to use for each feature, and a **report skill** that turns Orchestrator data into one of 15 reports, from a monthly availability report and a NOC digest to path quality, WAN traffic and an executive summary (one HTML file; code computes every number).
 - **Tested on a real Orchestrator.** Run end to end against Orchestrator 9.7.1 with five EC-V appliances (ECOS 9.6 and 9.7), including two-step writes, the audit outputs and HTTPS through Caddy and Nginx Proxy Manager.
 
 > Independent project, not affiliated with or supported by HPE. Provided as is, without warranty: you are responsible for every change made through it, by you or by an assistant you connect. See [NOTICE](NOTICE).
@@ -164,7 +164,38 @@ The playbooks are for reference only. Every operation the skill names passed in 
 
 ## Report skill
 
-`skills/edgeconnect-report/` builds six reports: `availability` (monthly service level and path quality), `noc` (what is broken now, last 24 hours and 7 days), `capacity` (WAN links by P95 utilisation), `lifecycle` (software, licences, backups and known security advisories), `incident` (one window of at most 7 days: alarms, affected sites, and changes in it and the 24 hours before, read live from the Orchestrator's audit log, `GET /action`) and `executive` (a one-page summary of the first four). Code does the reading and the maths; the assistant only writes the prose, and a validator rejects prose that types a number or contradicts a computed status:
+`skills/edgeconnect-report/` builds 15 reports, all with the same layout: a headline with an overall status, a verdict naming the areas that need attention, headline figures, then numbered sections with key points, possible causes, recommended actions and a table.
+
+| Report | For | What it covers |
+|---|---|---|
+| `availability` | service owner | monthly service level: appliance reachability, tunnel and interface availability, transports, path quality |
+| `noc` | NOC on shift | what is broken now: unreachable appliances, active alarms, health, tunnels down, sites needing attention (last 24 hours and 7 days) |
+| `capacity` | network planner | WAN links by P95 utilisation against a planning limit |
+| `lifecycle` | platform owner | software versions, licences, backups and known security advisories |
+| `incident` | incident lead | one window of at most 7 days: alarms, affected sites, and changes in it and the 24 hours before (from the audit log, `GET /action`) |
+| `executive` | management | a one-page summary across the other reports |
+| `traffic` | network engineer | what uses the WAN: change against the previous period, applications by share, top talkers, domains, countries, ports and traffic classes |
+| `paths` | network engineer | every active path ranked worst first, loss hidden by FEC, transports compared, worst paths by hour |
+| `operations` | team lead | weekly summary: appliance state, active alarms, health by category, tunnels down, worst paths, busiest WAN links, one list of recommended actions |
+| `optimisation` | network engineer | data reduction by appliance (optimised traffic: LAN bytes against WAN bytes) |
+| `security` | security team | every zone pair with flows allowed and dropped, policy and routing drops |
+| `activity` | change manager | changes from the audit log, alarms by type, repeating alarms, alarms within an hour of a change |
+| `site` | site owner | one appliance: state, alarms, health, tunnels, paths, WAN links, traffic and changes (needs `--scope` with one appliance) |
+| `custom` | anyone | the sections you pick (needs `--parts`) |
+| `health` | NOC | daily health check: NOC sections, every path, the day's changes and alarms, and a watch list of what is degraded but not yet failed |
+
+<p>
+<img src="docs/images/report-executive-light.png" alt="Executive summary report: overall Critical status, seven areas needing attention, headline figures for appliance reachability, path quality, WAN traffic, utilisation, alarms and licence expiry" width="49%">
+<img src="docs/images/report-noc-dark.png" alt="NOC digest in the dark theme: unreachable appliances, active critical and major alarms, tunnels down and sites needing attention" width="49%">
+</p>
+<p>
+<img src="docs/images/report-paths-table-light.png" alt="Path quality report table ranking every active tunnel worst first, with loss before and after FEC, latency, jitter, MOS, status and the reason" width="69%">
+<img src="docs/images/report-executive-light-phone.png" alt="Executive summary on a phone-width screen" width="29%">
+</p>
+
+<sub>Rendered from a real Orchestrator 10.0 with 66 appliances. Appliance, site, user and Orchestrator names and IP addresses were replaced before rendering.</sub>
+
+Code does the reading and the maths; the assistant only writes the prose, and a validator rejects prose that types a number or contradicts a computed status. A consistency check (`report.consistency`, run by the tests on every report) makes sure no two places on one page disagree: the verdict names exactly the sections flagged in the index, every count matches its table, every total matches the sum of its rows (or shows no data when a part is missing), and no missing data is shown as Good:
 
 ```bash
 edgeconnect-mcp report collect --orchestrator lab --report availability --period last-month --out rep
