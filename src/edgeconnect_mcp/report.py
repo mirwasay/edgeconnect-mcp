@@ -30,7 +30,7 @@ from .errors import EdgeConnectError
 from .server import HOME_DOTENV, Server, ToolError
 
 STATUSES = ("green", "amber", "red", "grey")
-REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations")
+REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations", "optimisation", "security", "activity")
 SECTIONS = {
     "availability": (("avail-summary", "Availability summary"), ("avail-appliances", "Appliance reachability"),
                      ("avail-tunnels", "Tunnel availability"), ("avail-paths", "Path quality"), ("avail-alarms", "Alarms in the period"), ("data-gaps", "Data gaps")),
@@ -49,6 +49,10 @@ SECTIONS = {
                 ("traffic-countries", "Countries"), ("traffic-ports", "Ports"), ("traffic-classes", "Traffic classes"), ("data-gaps", "Data gaps")),
     "paths": (("paths-summary", "Path quality summary"), ("paths-ranked", "Every active path, worst first"), ("paths-fec", "Loss hidden by FEC"),
               ("paths-transport", "Transports compared"), ("data-gaps", "Data gaps")),
+    "optimisation": (("opt-summary", "WAN optimisation summary"), ("opt-appliances", "Reduction by appliance"), ("data-gaps", "Data gaps")),
+    "security": (("sec-summary", "Firewall summary"), ("sec-pairs", "Zone pairs"), ("data-gaps", "Data gaps")),
+    "activity": (("act-summary", "Change and alarm summary"), ("act-changes", "Changes"), ("act-alarms", "Alarms by type"), ("act-repeat", "Repeating alarms"),
+                 ("act-after-change", "Alarms within an hour of a change"), ("data-gaps", "Data gaps")),
     "incident": (("inc-summary", "Incident summary"), ("inc-timeline", "Alarm timeline"), ("inc-appliances", "Affected appliances"),
                  ("inc-paths", "Path quality in the window"), ("inc-changes", "Changes in the window and the 24 hours before"), ("data-gaps", "Data gaps")),
 }
@@ -56,11 +60,13 @@ ALWAYS_DOWN = 0.99  # a tunnel group up less than 1% of the period counts as dow
 TITLES = {"availability": "Availability report", "noc": "NOC digest", "capacity": "WAN capacity report",
           "lifecycle": "Lifecycle, licence and vulnerability report", "incident": "Major incident report",
           "executive": "Executive summary", "traffic": "Traffic and applications report",
-          "paths": "Path quality report", "operations": "Operations summary"}
+          "paths": "Path quality report", "operations": "Operations summary", "optimisation": "WAN optimisation report",
+          "security": "Firewall report", "activity": "Change and alarm activity report"}
 INCIDENT_LOOKBACK_MS = 24 * 3600000  # changes in the 24 hours before an incident are shown next to it
 INCIDENT_MAX_APPLIANCES = 20
 INCIDENT_MAX_MS = 7 * 86400000  # longer windows are periods, not incidents (and the minute reachability is read per day)
 AUDIT_PAGE = 10000  # GET /action returns at most this many entries, newest first
+AUDIT_MAX_PAGES = 50  # activity report: at most this many pages (500,000 changes) before the rest is a named gap
 # The executive page's KPI strip: availability, overlays, sites below target, critical alarms, licence, capacity, NOC, advisories.
 EXEC_KPIS = ("fleet_reach_pct", "paths_ok_pct", "wan_bytes_total", "worst_p95_pct", "active_critical", "license_days_left")
 PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle", "traffic", "paths"), "operations": ("noc", "paths", "capacity")}  # reports that combine others; the rest are themselves
@@ -75,7 +81,7 @@ DEFAULT_OPTIONS = {"period": "last-month", "scope": "all", "target": "orchestrat
 SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
 MAX_ALARMS = 10000
 WINDOW_PERIODS = {"last-24-hours": 86400, "last-7-days": 7 * 86400}  # rolling windows ending now, for reports that read stats aggregates
-DEFAULT_PERIOD = {"traffic": "last-7-days", "paths": "last-7-days", "operations": "last-7-days"}  # every other report defaults to DEFAULT_OPTIONS["period"]
+DEFAULT_PERIOD = {r: "last-7-days" for r in ("traffic", "paths", "operations", "optimisation", "security", "activity")}  # every other report defaults to DEFAULT_OPTIONS["period"]
 TRAFFIC_TOP = 100000  # `top` sent so the Orchestrator returns every application, domain and port, not its default ten
 TALKERS_CAP = 100  # GET /stats/aggregate/topTalkers returns at most 100 per appliance whatever `top` asks (seteam, 10.0, 2026-11-08)
 TRAFFIC_PATHS = ("/stats/aggregate/application2", "/stats/aggregate/topTalkers", "/stats/aggregate/dns", "/stats/aggregate/ports", "/stats/aggregate/trafficClass")
@@ -205,7 +211,7 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
     period = period or DEFAULT_PERIOD.get(report, DEFAULT_OPTIONS["period"])
     options = {"period": "month" if month else period, "scope": "all", "target": target, "down_tunnels": down_tunnels}
     if period in WINDOW_PERIODS and not month:
-        if report not in ("traffic", "paths", "operations", "noc", "lifecycle"):
+        if report not in tuple(DEFAULT_PERIOD) + ("noc", "lifecycle"):
             raise ValueError("--period {} is for the traffic report; {} takes a month (last-month, month-to-date or --month)".format(period, report))
         end_ms = int(now.timestamp()) // 3600 * 3600 * 1000  # whole hours, so the previous window lines up
         start_ms, first = end_ms - WINDOW_PERIODS[period] * 1000, None
@@ -237,6 +243,34 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
         _collect_lifecycle(c, nepks)
     if "traffic" in parts:
         _collect_traffic(c, nepks, start_ms // 1000, end_ms // 1000)
+    span = {"startTime": start_ms // 1000, "endTime": end_ms // 1000, "granularity": "day"}
+    if "optimisation" in parts:
+        for ne in nepks:
+            c.call("flows:" + ne, "/stats/aggregate/flow", dict(span, nePk=ne, trafficType="optimized_traffic"))
+    if "security" in parts:
+        c.call("zones", "/zones")
+        for ne in nepks:
+            c.call("security:" + ne, "/stats/aggregate/securityPolicy", dict(span, nePk=ne))
+    if "activity" in parts:
+        keep = ("id", "queuedTime", "user", "name", "nepk", "completionStatus")
+        entries: Optional[List[Dict[str, Any]]] = []
+        until, pages = end_ms, 0
+        while True:  # GET /action pages newest first: a full page means older entries remain, so read again up to its oldest entry
+            page = c.call("activity_audit_page", "/action", {"startTime": start_ms, "endTime": until, "limit": AUDIT_PAGE}, keep=False)
+            if not isinstance(page, list):
+                entries = None if not entries else entries
+                break
+            entries += [{k: r.get(k) for k in keep} for r in page if isinstance(r, dict)]
+            pages += 1
+            oldest = min((r.get("queuedTime") or until for r in page if isinstance(r, dict)), default=until)
+            if len(page) < AUDIT_PAGE or oldest <= start_ms or pages >= AUDIT_MAX_PAGES:
+                break
+            until = oldest - 1
+        c.data["activity_audit"] = _merge_by_id(entries) if entries is not None else None
+        c.data["activity_audit_full"] = pages >= AUDIT_MAX_PAGES
+        rows, failed, notes, source = read_alarms(c.pager(), nepks, c.read_posts, start_ms, end_ms)
+        c.data["activity_alarms"] = _merge_by_id(rows, History(history_root, c.orchestrator).load("alarms", start_ms, end_ms))
+        c.data["activity_alarm_notes"] = notes + (["alarms not read for {} windows".format(len(failed))] if failed else [])
     if "paths" in parts:
         c.call("health_threshold", "/health/healthThresholdConfig")
         # Hourly buckets are kept about 14 days (GET /gms/stats/retention); older windows use daily ones.
@@ -633,6 +667,12 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         sections.update(_traffic(ctx))
     if "paths" in parts:
         sections.update(_path_report(ctx))
+    if "optimisation" in parts:
+        sections.update(_optimisation(ctx))
+    if "security" in parts:
+        sections.update(_security(ctx))
+    if "activity" in parts:
+        sections.update(_activity(ctx))
 
     if report == "executive":
         reachable_now = [a for a in inventory if a.get("state") == 1]
@@ -903,6 +943,104 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     sections["paths-summary"] = {"status": worst([ranked["status"], sections["paths-fec"]["status"]]),
                                  "metrics": [m for m in ("paths_ok_pct", "paths_measured", "paths_red", "paths_amber", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
     return sections
+
+
+def _optimisation(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Optimised traffic only: LAN bytes in and out against WAN bytes; saved = LAN - WAN, reduction = saved / LAN."""
+    data, names, metric = ctx["data"], ctx["names"], ctx["metric"]
+    rows = []
+    for ne, name in names.items():
+        lan = wan = 0.0
+        found = False
+
+        def walk(node: Any) -> None:
+            nonlocal lan, wan, found
+            if isinstance(node, dict):
+                if node.get("nePk") == ne and "SUM_LRX_BYTES" in node:
+                    found = True
+                    lan += float(node.get("SUM_LRX_BYTES") or 0) + float(node.get("SUM_LTX_BYTES") or 0)
+                    wan += float(node.get("SUM_WTX_BYTES") or 0) + float(node.get("SUM_WRX_BYTES") or 0)
+                    return
+                for v in node.values():
+                    walk(v)
+        walk(data.get("flows:" + str(ne)))
+        if found:
+            rows.append({"appliance": name, "lan_bytes": int(lan), "wan_bytes": int(wan), "saved_bytes": int(lan - wan), "reduction_pct": _pct(lan - wan, lan)})
+    rows.sort(key=lambda r: -r["saved_bytes"])
+    lan, wan = sum(r["lan_bytes"] for r in rows), sum(r["wan_bytes"] for r in rows)
+    status = "green" if rows else "grey"
+    ids = [metric("opt_reduction_pct", _pct(lan - wan, lan), "%", "Reduction of optimised traffic"), metric("opt_saved_bytes", lan - wan if rows else None, "bytes", "WAN bytes saved"),
+           metric("opt_lan_bytes", lan if rows else None, "bytes", "Optimised traffic before reduction")]
+    return {"opt-summary": {"status": status, "metrics": ids},
+            "opt-appliances": {"status": status, "metrics": [], "table": rows, "notes": ["Optimised traffic only (GET /stats/aggregate/flow, trafficType optimized_traffic): "
+                                                                                    "LAN bytes in and out against WAN bytes out and in. Pass-through traffic is not reduced and is left out."],
+                               "chart": {"title": "Reduction by appliance, % (largest 15 by bytes saved)", "zoom": False,
+                                         "points": [(r["appliance"], r["reduction_pct"]) for r in rows[:15] if r["reduction_pct"] is not None]}}}
+
+
+def _security(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Firewall flows allowed and dropped per zone pair, summed over the appliances; zone ids named from GET /zones."""
+    data, names, metric = ctx["data"], ctx["names"], ctx["metric"]
+    zones = data.get("zones") if isinstance(data.get("zones"), dict) else {}
+    zone = lambda z: str((zones.get(str(z)) or {}).get("name") or "zone {}".format(z))
+    pairs: Dict[Tuple[str, str], Dict[str, float]] = {}
+    for ne in names:
+        for row in data.get("security:" + str(ne)) or []:
+            if isinstance(row, dict):
+                p = pairs.setdefault((zone(row.get("fromZone")), zone(row.get("toZone"))), {"allowed": 0, "dropped": 0, "policy": 0, "routing": 0})
+                for key, field in (("allowed", "flows_allowed"), ("dropped", "flows_dropped"), ("policy", "policy_drop_pkts"), ("routing", "routing_drop_pkts")):
+                    p[key] += float(row.get(field) or 0)
+    rows = [{"from_zone": a, "to_zone": b, "flows_allowed": int(v["allowed"]), "flows_dropped": int(v["dropped"]), "dropped_pct": _pct(v["dropped"], v["allowed"] + v["dropped"]),
+             "policy_drop_packets": int(v["policy"]), "routing_drop_packets": int(v["routing"])} for (a, b), v in pairs.items()]
+    rows.sort(key=lambda r: (-r["flows_dropped"], r["from_zone"], r["to_zone"]))
+    status = "green" if rows else "grey"
+    ids = [metric("sec_flows_dropped", sum(r["flows_dropped"] for r in rows) if rows else None, "flows", "Flows dropped by the firewall"),
+           metric("sec_flows_allowed", sum(r["flows_allowed"] for r in rows) if rows else None, "flows", "Flows allowed"),
+           metric("sec_zone_pairs", len(rows), "zone pairs", "Zone pairs with traffic")]
+    return {"sec-summary": {"status": status, "metrics": ids},
+            "sec-pairs": {"status": status, "metrics": [], "table": rows, "notes": ["Policy drops are flows denied by a firewall rule; routing drops are packets with no route."]}}
+
+
+def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Changes from the audit log and alarms raised in the window: by type, repeating ones, and alarms soon after a change."""
+    data, names, metric, gaps = ctx["data"], ctx["names"], ctx["metric"], ctx["gaps"]
+    audit = data.get("activity_audit")
+    alarms = [a for a in data.get("activity_alarms") or [] if a.get("applianceId") in names]
+    for note in data.get("activity_alarm_notes") or []:
+        gaps.append("Alarms: " + note)
+    if audit is None:
+        gaps.append("Changes: GET /action could not be read.")
+    if data.get("activity_audit_full"):
+        gaps.append("Changes: {} pages of the audit log were read ({} entries); older changes in the window are not listed.".format(AUDIT_MAX_PAGES, AUDIT_MAX_PAGES * AUDIT_PAGE))
+    changes = [{"time": _when(r.get("queuedTime")), "user": r.get("user"), "appliance": names.get(r.get("nepk"), r.get("nepk") or ""), "change": r.get("name"),
+                "result": "failed" if _failed(r) else "ok"} for r in sorted(audit or [], key=lambda r: -(r.get("queuedTime") or 0))]
+    by_type: Dict[Tuple[str, str], int] = {}
+    repeat: Dict[Tuple[Any, str], int] = {}
+    for a in alarms:
+        sev, name = str(a.get("severity") or "").lower(), str(a.get("name") or a.get("description") or "")
+        by_type[(name, sev)] = by_type.get((name, sev), 0) + 1
+        repeat[(a.get("applianceId"), name)] = repeat.get((a.get("applianceId"), name), 0) + 1
+    type_rows = [{"alarm": n, "severity": sev, "times": k} for (n, sev), k in sorted(by_type.items(), key=lambda i: (SEVERITY_ORDER.get(i[0][1], 9), -i[1]))]
+    repeat_rows = [{"appliance": names.get(ne, ne), "alarm": n, "times": k} for (ne, n), k in sorted(repeat.items(), key=lambda i: -i[1]) if k >= 3]
+    after = []
+    for a in alarms:  # raised within an hour after a change on the same appliance
+        raised = a.get("timeOccurredInMills") or 0
+        hit = next((r for r in audit or [] if r.get("nepk") == a.get("applianceId") and 0 <= raised - (r.get("queuedTime") or 0) <= 3600000), None)
+        if hit:
+            after.append({"appliance": names.get(a.get("applianceId")), "alarm": str(a.get("name") or ""), "raised": _when(raised), "after_change": hit.get("name")})
+    to_clear = sorted((a["clearedTimeInMills"] - a["timeOccurredInMills"]) / 60000.0 for a in alarms
+                      if isinstance(a.get("clearedTimeInMills"), (int, float)) and a["clearedTimeInMills"] > 0 and isinstance(a.get("timeOccurredInMills"), (int, float)))
+    failed = sum(r["result"] == "failed" for r in changes)
+    ids = [metric("act_changes", len(changes) if audit is not None else None, "changes", "Changes in the audit log"),
+           metric("act_changes_failed", failed if audit is not None else None, "changes", "Changes that failed", "amber" if failed else "green"),
+           metric("act_alarms", len(alarms), "alarms", "Alarms raised"), metric("act_repeat", len(repeat_rows), "alarms", "Alarms raised 3 or more times on one appliance"),
+           metric("act_median_clear_min", round(statistics.median(to_clear), 1) if to_clear else None, "minutes", "Median time to clear")]
+    return {"act-summary": {"status": "amber" if failed or repeat_rows else "green", "metrics": ids},
+            "act-changes": {"status": "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes},
+            "act-alarms": {"status": "green", "metrics": [], "table": type_rows},
+            "act-repeat": {"status": "amber" if repeat_rows else "green", "metrics": [], "table": repeat_rows, "notes": ["An alarm raised 3 or more times on one appliance in the window."]},
+            "act-after-change": {"status": "amber" if after else "green", "metrics": [], "table": after,
+                                 "notes": ["Alarms raised within an hour after a change on the same appliance. Timing only: it does not show that the change caused the alarm."]}}
 
 
 def _when(ms: Any) -> str:

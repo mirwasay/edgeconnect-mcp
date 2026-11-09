@@ -39,6 +39,20 @@
     {"id": "check_masked_circuits", "text": "Check the circuits behind these paths with their carrier: the loss before FEC is the circuit's real quality.", "when": [["paths_fec_masking", ">", 0]]}
    ]
   },
+  "act-changes": {
+   "causes": [],
+   "actions": [
+    {"id": "review_failed_changes", "text": "Review the failed changes in the table, newest first: a failed template or configuration push leaves the appliance different from what the Orchestrator expects.", "when": [["act_changes_failed", ">", 0]]}
+   ]
+  },
+  "act-repeat": {
+   "causes": [
+    {"id": "flapping", "text": "An alarm raised again and again on one appliance usually means a flapping link, tunnel or service rather than separate events.", "when": [["act_repeat", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "fix_repeaters", "text": "Start with the appliances at the top of the repeating-alarm table; fixing one flapping path often removes most of the alarm load.", "when": [["act_repeat", ">", 0]]}
+   ]
+  },
   "avail-alarms": {
    "causes": [],
    "actions": [
