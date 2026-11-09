@@ -30,7 +30,7 @@ from .errors import EdgeConnectError
 from .server import HOME_DOTENV, Server, ToolError
 
 STATUSES = ("green", "amber", "red", "grey")
-REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive")
+REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic")
 SECTIONS = {
     "availability": (("avail-summary", "Availability summary"), ("avail-appliances", "Appliance reachability"),
                      ("avail-tunnels", "Tunnel availability"), ("avail-paths", "Path quality"), ("avail-alarms", "Alarms in the period"), ("data-gaps", "Data gaps")),
@@ -42,13 +42,15 @@ SECTIONS = {
     "executive": (("exec-fleet", "Fleet"), ("exec-availability", "Availability"), ("exec-alarms", "Active alarms"),
                   ("exec-licensing", "Licensing"), ("exec-software", "Software versions"), ("exec-capacity", "WAN capacity"),
                   ("exec-noc", "NOC digest"), ("exec-lifecycle", "Lifecycle and vulnerabilities"), ("data-gaps", "Data gaps")),
+    "traffic": (("traffic-summary", "Traffic summary"), ("traffic-apps", "Applications"), ("traffic-talkers", "Top talkers"), ("traffic-domains", "Domains"),
+                ("traffic-countries", "Countries"), ("traffic-ports", "Ports"), ("traffic-classes", "Traffic classes"), ("data-gaps", "Data gaps")),
     "incident": (("inc-summary", "Incident summary"), ("inc-timeline", "Alarm timeline"), ("inc-appliances", "Affected appliances"),
                  ("inc-paths", "Path quality in the window"), ("inc-changes", "Changes in the window and the 24 hours before"), ("data-gaps", "Data gaps")),
 }
 ALWAYS_DOWN = 0.99  # a tunnel group up less than 1% of the period counts as down for the whole period: listed apart, not averaged in
 TITLES = {"availability": "Availability report", "noc": "NOC digest", "capacity": "WAN capacity report",
           "lifecycle": "Lifecycle, licence and vulnerability report", "incident": "Major incident report",
-          "executive": "Executive summary"}
+          "executive": "Executive summary", "traffic": "Traffic and applications report"}
 INCIDENT_LOOKBACK_MS = 24 * 3600000  # changes in the 24 hours before an incident are shown next to it
 INCIDENT_MAX_APPLIANCES = 20
 INCIDENT_MAX_MS = 7 * 86400000  # longer windows are periods, not incidents (and the minute reachability is read per day)
@@ -63,10 +65,16 @@ WAN_INTERFACE = re.compile(r"^b?wan\d", re.I)  # WAN ports and their VLANs (wan0
 HEALTH_VERTICALS = ["ALARM", "LOSS", "LATENCY", "JITTER", "MOS", "BW_UTILIZATION"]
 HOURLY_RETENTION = 14 * 86400  # fallback when GET /gms/stats/retention cannot be read: hourly interface stats kept 14 days by default
 # Report options: the only choices a user (or the agent asking them) can make; argparse enforces them and the report prints them.
-OPTIONS = {"period": ("last-month", "month-to-date"), "target": ("orchestrator", "99.5", "99.9", "99.99"), "down_tunnels": ("include", "separate")}
+OPTIONS = {"period": ("last-month", "month-to-date", "last-7-days", "last-24-hours"), "target": ("orchestrator", "99.5", "99.9", "99.99"), "down_tunnels": ("include", "separate")}
 DEFAULT_OPTIONS = {"period": "last-month", "scope": "all", "target": "orchestrator", "down_tunnels": "separate"}  # separate: approved 2026-11-09, idle paths drowned the figures
 SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
-MAX_ALARMS = 10000  # maxAlarms sent; a list this long may be cut, so it is reported as a gap
+MAX_ALARMS = 10000
+WINDOW_PERIODS = {"last-24-hours": 86400, "last-7-days": 7 * 86400}  # rolling windows ending now, for reports that read stats aggregates
+DEFAULT_PERIOD = {"traffic": "last-7-days"}  # every other report defaults to DEFAULT_OPTIONS["period"]
+TRAFFIC_TOP = 100000  # `top` sent so the Orchestrator returns every application, domain and port, not its default ten
+TALKERS_CAP = 100  # GET /stats/aggregate/topTalkers returns at most 100 per appliance whatever `top` asks (seteam, 10.0, 2026-11-08)
+TRAFFIC_PATHS = ("/stats/aggregate/application2", "/stats/aggregate/topTalkers", "/stats/aggregate/dns", "/stats/aggregate/ports", "/stats/aggregate/trafficClass")
+PROTOCOLS = {6: "tcp", 17: "udp", 1: "icmp"}  # maxAlarms sent; a list this long may be cut, so it is reported as a gap
 # Loss % is lost / (received + lost) packets. Below this many received packets in the period a loss % means little (the loss
 # counters also count probe packets), so a tunnel that lost probes there is "no traffic, probes lost" and red. Seen on 10.0: idle
 # SSE and guest overlays with 0 packets received and thousands lost.
@@ -178,7 +186,7 @@ def resolve_month(period: str, now: datetime) -> str:
 
 
 def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = None, appliances: Optional[List[str]] = None, top: Optional[int] = None,
-            now: Optional[datetime] = None, period: str = "last-month", target: str = "orchestrator", down_tunnels: str = DEFAULT_OPTIONS["down_tunnels"],
+            now: Optional[datetime] = None, period: Optional[str] = None, target: str = "orchestrator", down_tunnels: str = DEFAULT_OPTIONS["down_tunnels"],
             window: Optional[Tuple[datetime, datetime]] = None, alarm_id: Optional[str] = None, history_root: Path = HISTORY_ROOT) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if report == "incident" and not window and not alarm_id:
@@ -186,10 +194,18 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
     for name, value in (("target", target), ("down_tunnels", down_tunnels)):
         if value not in OPTIONS[name]:
             raise ValueError("{} must be one of {}".format(name, ", ".join(OPTIONS[name])))
+    period = period or DEFAULT_PERIOD.get(report, DEFAULT_OPTIONS["period"])
     options = {"period": "month" if month else period, "scope": "all", "target": target, "down_tunnels": down_tunnels}
-    month = month or resolve_month(period, now)
+    if period in WINDOW_PERIODS and not month:
+        if report not in ("traffic", "noc", "lifecycle"):
+            raise ValueError("--period {} is for the traffic report; {} takes a month (last-month, month-to-date or --month)".format(period, report))
+        end_ms = int(now.timestamp()) // 3600 * 3600 * 1000  # whole hours, so the previous window lines up
+        start_ms, first = end_ms - WINDOW_PERIODS[period] * 1000, None
+        month = period
+    else:
+        month = month or resolve_month(period, now)
+        first, start_ms, end_ms = month_window(month, now)
     options["month"] = month
-    first, start_ms, end_ms = month_window(month, now)
     c = Collector(server, orchestrator)
     c.call("versions", "/gms/versions")
     inventory = c.call("appliances", "/appliance") or []
@@ -211,6 +227,8 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
         _collect_capacity(c, nepks, start_ms // 1000, end_ms // 1000, top, int(now.timestamp()))
     if "lifecycle" in parts:
         _collect_lifecycle(c, nepks)
+    if "traffic" in parts:
+        _collect_traffic(c, nepks, start_ms // 1000, end_ms // 1000)
     now_ms = int(now.timestamp() * 1000)
     c.data["read_posts"] = c.read_posts
     if "incident" in parts:
@@ -380,6 +398,20 @@ def _collect_incident(c: Collector, inventory: List[Dict[str, Any]], scoped: boo
         c.call("paths:" + ne, "/stats/aggregate/tunnel", {"nePk": ne, "startTime": start_ms // 1000, "endTime": end_ms // 1000, "granularity": granularity})
     c.data["incident"] = {"from_ms": start_ms, "to_ms": end_ms, "affected": affected, "granularity": granularity, "alarm_id": alarm_id}
     return start_ms, end_ms
+
+
+def _collect_traffic(c: Collector, nepks: List[str], start_s: int, end_s: int) -> None:
+    """Per appliance (the Orchestrator has no fleet total for these: groupPk returns a few appliances' rows), then the previous window."""
+    span = end_s - start_s
+    window = {"startTime": start_s, "endTime": end_s}
+    for ne in nepks:
+        c.call("apps:" + ne, "/stats/aggregate/application2", dict(window, nePk=ne, top=TRAFFIC_TOP))
+        c.call("talkers:" + ne, "/stats/aggregate/topTalkers", dict(window, nePk=ne, top=TALKERS_CAP))
+        c.call("dns:" + ne, "/stats/aggregate/dns", dict(window, nePk=ne, top=TRAFFIC_TOP, groupBy="country"))  # groupBy=dns is empty on 10.0
+        c.call("ports:" + ne, "/stats/aggregate/ports", dict(window, nePk=ne, top=TRAFFIC_TOP))
+        c.call("classes:" + ne, "/stats/aggregate/trafficClass", dict(window, nePk=ne, granularity="hour" if span <= 86400 else "day", trafficType="all_traffic"))
+    for ne in nepks:
+        c.call("apps_previous:" + ne, "/stats/aggregate/application2", {"startTime": start_s - span, "endTime": start_s, "nePk": ne, "top": TRAFFIC_TOP})
 
 
 def _collect_lifecycle(c: Collector, nepks: List[str]) -> None:
@@ -575,6 +607,8 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         sections.update(_lifecycle(ctx))
     if "incident" in parts:
         sections.update(_incident(ctx))
+    if "traffic" in parts:
+        sections.update(_traffic(ctx))
 
     if report == "executive":
         reachable_now = [a for a in inventory if a.get("state") == 1]
@@ -1079,6 +1113,108 @@ def _good_share(value: Any, names: Mapping[Any, Any], since: float) -> Dict[str,
     return {"all": _pct(good, total), "by_ne": by_ne}
 
 
+def _wan(row: Mapping[str, Any], tx: str, rx: str) -> int:
+    return int(float(row.get(tx) or 0) + float(row.get(rx) or 0))
+
+
+def _header_rows(value: Any) -> List[Dict[str, Any]]:
+    """Positional rows ([{"<nePk>": [[...], ...]}, {"header": [[names]]}]) as dicts, for every appliance in the answer."""
+    items = value if isinstance(value, list) else []
+    header = next((i["header"][0] for i in items if isinstance(i, dict) and isinstance(i.get("header"), list) and i["header"]), None)
+    if not header:
+        return []
+    return [dict(zip(header, row)) for i in items if isinstance(i, dict) and "header" not in i for rows in i.values() if isinstance(rows, list)
+            for row in rows if isinstance(row, list)]
+
+
+def _shares(totals: Mapping[str, int], key: str) -> List[Dict[str, Any]]:
+    """Every entry, largest first, with its share of the table's total."""
+    whole = sum(totals.values())
+    return [{key: name, "wan_bytes": n, "share_pct": round(100.0 * n / whole, 2) if whole else None}
+            for name, n in sorted(totals.items(), key=lambda i: (-i[1], str(i[0])))]
+
+
+def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """WAN bytes (sent + received) by application, talker, domain, country, port and traffic class, summed over the appliances."""
+    data, names, metric = ctx["data"], ctx["names"], ctx["metric"]
+    apps: Dict[str, int] = {}
+    total = previous = 0
+    read_now = read_before = False
+    for ne in names:
+        for key, is_now in (("apps:", True), ("apps_previous:", False)):
+            rows = data.get(key + str(ne))
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                n = _wan(row, "SUM_WTX_BYTES", "SUM_WRX_BYTES")
+                if row.get("APPNAME") == "__total__":
+                    total, previous = (total + n, previous) if is_now else (total, previous + n)
+                elif is_now:
+                    apps[str(row.get("APPNAME"))] = apps.get(str(row.get("APPNAME")), 0) + n
+            read_now, read_before = read_now or is_now, read_before or not is_now
+    app_rows = _shares(apps, "application")
+    for r in app_rows:  # share of all WAN traffic (the __total__ rows), not of the named applications only
+        r["share_pct"] = round(100.0 * r["wan_bytes"] / total, 2) if total else None
+    change = round(100.0 * (total - previous) / previous, 2) if read_before and previous else None
+    status = "green" if read_now else "grey"
+    sections: Dict[str, Dict[str, Any]] = {}
+    m_total = metric("wan_bytes_total", total if read_now else None, "bytes", "WAN traffic, sent and received")
+    m_change = metric("wan_bytes_change_pct", change, "%", "Change against the previous period of the same length")
+    m_top = metric("top_app_share_pct", app_rows[0]["share_pct"] if app_rows else None, "%", "Largest application's share of WAN traffic")
+    m_apps = metric("applications_seen", len(app_rows), "applications", "Applications with traffic")
+    sections["traffic-apps"] = {"status": status, "metrics": [m_apps, m_top], "table": app_rows,
+                                "chart": {"title": "Share of WAN traffic by application, % (largest 15)", "zoom": False,
+                                          "points": [(r["application"], r["share_pct"]) for r in app_rows[:15] if r["share_pct"] is not None]}}
+    talkers = []
+    for ne, name in names.items():
+        for item in data.get("talkers:" + str(ne)) or []:
+            for row in (item.get(ne) or []) if isinstance(item, dict) else []:
+                talkers.append({"appliance": name, "source_ip": row.get("SOURCE_IP"), "wan_bytes": _wan(row, "WANTX_BYTES", "WANRX_BYTES")})
+    talkers.sort(key=lambda r: -r["wan_bytes"])
+    sections["traffic-talkers"] = {"status": "green" if talkers else "grey", "metrics": [], "table": talkers,
+                                   "notes": ["The Orchestrator returns the top talkers capped at {} per appliance, so smaller talkers are not listed.".format(TALKERS_CAP)]}
+    domains: Dict[str, int] = {}
+    countries: Dict[str, int] = {}
+    ports: Dict[str, int] = {}
+    for ne in names:
+        for row in _header_rows(data.get("dns:" + str(ne))):
+            n = _wan(row, "WANTX_BYTES", "WANRX_BYTES")
+            domain = str(row.get("DNS") or row.get("CALC_DNS") or row.get("IPADDR") or "unknown")
+            country = str(row.get("COUNTRY") or "unknown")
+            domains[domain] = domains.get(domain, 0) + n
+            countries[country] = countries.get(country, 0) + n
+        for row in _header_rows(data.get("ports:" + str(ne))):
+            key = "{}/{}".format(row.get("PORT"), PROTOCOLS.get(row.get("PROTOCOL"), row.get("PROTOCOL")))
+            ports[key] = ports.get(key, 0) + _wan(row, "WANTX_BYTES", "WANRX_BYTES")
+    for sid, totals, key, note in (("traffic-domains", domains, "domain", "Named by DNS where the appliance saw the lookup, else by IP address."),
+                                   ("traffic-countries", countries, "country", "RFC1918 is private address space (inside your network)."),
+                                   ("traffic-ports", ports, "port", "Port and protocol of the flows, both directions.")):
+        rows = _shares(totals, key)
+        sections[sid] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": [note],
+                         "chart": {"title": "Share of WAN traffic, % (largest 15)", "zoom": False, "points": [(r[key], r["share_pct"]) for r in rows[:15] if r["share_pct"] is not None]}}
+    classes: Dict[str, int] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if "TRAFFIC_CLASS" in node and node.get("nePk") in names:
+                cls = "class {}".format(node["TRAFFIC_CLASS"])
+                classes[cls] = classes.get(cls, 0) + _wan(node, "SUM_WTX_BYTES", "SUM_WRX_BYTES")
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    for ne in names:
+        walk(data.get("classes:" + str(ne)))
+    rows = _shares(classes, "traffic_class")
+    sections["traffic-classes"] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": ["Traffic classes as defined in the QoS (shaper) policy, all traffic types."]}
+    sections["traffic-summary"] = {"status": status, "metrics": [m_total, m_change, m_top, m_apps]}
+    if read_now and not read_before:
+        ctx["gaps"].append("Traffic: the previous period could not be read, so the change is not shown.")
+    return sections
+
+
 def metrics_status(ctx: Dict[str, Any], mid: str) -> str:
     return ctx["metrics"][mid].get("status") or "grey"
 
@@ -1261,6 +1397,8 @@ def _fmt(metric: Mapping[str, Any], unit_word: bool = True) -> str:
     if isinstance(value, float):
         value = "{:.2f}".format(value)
     unit = metric.get("unit") or ""
+    if unit == "bytes" and isinstance(metric.get("value"), (int, float)):
+        return layout.human_bytes(metric["value"])
     if value == 1 and unit.endswith("s"):
         unit = unit[:-1]  # 1 alarm, 1 appliance
     return "{}{}".format(value, unit if unit == "%" else (" " + unit if unit and unit_word else ""))
@@ -1370,7 +1508,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("collect", help="read the Orchestrator and write bundle.json")
     p.add_argument("--orchestrator", required=True)
     p.add_argument("--report", choices=REPORTS, required=True)
-    p.add_argument("--period", choices=OPTIONS["period"], default=DEFAULT_OPTIONS["period"], help="availability and capacity period (default: last-month)")
+    p.add_argument("--period", choices=OPTIONS["period"], help="last-month (default; traffic: last-7-days), month-to-date, or for traffic last-7-days or last-24-hours")
     p.add_argument("--month", help="YYYY-MM: an explicit month instead of --period")
     p.add_argument("--scope", default="all", help="all (default), or comma-separated nePks or host names that this Orchestrator has")
     p.add_argument("--target", choices=OPTIONS["target"], default=DEFAULT_OPTIONS["target"], help="availability target: the Orchestrator's thresholds (default) or a fixed %%")
