@@ -948,6 +948,17 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(m["sections"]["traffic-talkers"]["table"][0], {"appliance": "branch-a", "source_ip": "10.1.1.1", "wan_bytes": 100})
         self.assertIn("capped at 100", " ".join(m["sections"]["traffic-talkers"]["notes"]))
 
+    def test_application_data_shorter_than_the_period_is_a_gap(self):
+        data = self.data()
+        for row in data["apps:1.NE"] + data["apps:2.NE"]:
+            row.update(MIN_TIMESTAMP=20 * 86400, MAX_TIMESTAMP=30 * 86400)  # only the last 10 days of a 30-day window
+        b = phase2_bundle("traffic", **data)
+        b["period"].update(from_ms=0, to_ms=30 * 86400000)
+        m = report.compute(b)
+        self.assertEqual(m["metrics"]["traffic_days_covered"]["value"], 10.0)  # first to last hourly bucket, plus that hour
+        self.assertIn("covers only", " ".join(m["sections"]["data-gaps"]["notes"]))
+        self.assertIsNone(m["metrics"]["wan_bytes_change_pct"]["value"])  # a part-period total is not compared
+
     def test_collect_reads_every_appliance_for_the_window_and_the_previous_one(self):
         client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
         with tempfile.TemporaryDirectory() as tmp:

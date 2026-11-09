@@ -616,6 +616,7 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     options = dict(DEFAULT_OPTIONS, month=bundle["period"]["month"])
     options.update(bundle.get("options") or {})
     ctx = {"data": data, "inventory": inventory, "names": names, "metric": metric, "metrics": metrics, "gaps": gaps, "stats_down": stats_down, "now_s": now_s, "options": options,
+           "period_from_s": bundle["period"]["from_ms"] // 1000,
            "period_s": max(1, (bundle["period"]["to_ms"] - bundle["period"]["from_ms"]) // 1000)}
     m_total = metric("appliances_total", len(inventory), "appliances", "Appliances in scope")
     if "availability" in parts:
@@ -1218,6 +1219,7 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     apps: Dict[str, int] = {}
     total = previous = 0
     read_now = read_before = False
+    stamps: List[float] = []
     for ne in names:
         for key, is_now in (("apps:", True), ("apps_previous:", False)):
             rows = data.get(key + str(ne))
@@ -1227,19 +1229,30 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 n = _wan(row, "SUM_WTX_BYTES", "SUM_WRX_BYTES")
                 if row.get("APPNAME") == "__total__":
                     total, previous = (total + n, previous) if is_now else (total, previous + n)
+                    if is_now:
+                        stamps += [float(row[k]) for k in ("MIN_TIMESTAMP", "MAX_TIMESTAMP") if isinstance(row.get(k), (int, float))]
                 elif is_now:
                     apps[str(row.get("APPNAME"))] = apps.get(str(row.get("APPNAME")), 0) + n
             read_now, read_before = read_now or is_now, read_before or not is_now
     app_rows = _shares(apps, "application")
     for r in app_rows:  # share of all WAN traffic (the __total__ rows), not of the named applications only
         r["share_pct"] = round(100.0 * r["wan_bytes"] / total, 2) if total else None
-    change = round(100.0 * (total - previous) / previous, 2) if read_before and previous else None
+    # Application stats are hourly only and kept about 14 days (GET /gms/stats/retention "flowapp"): an older period is only partly there.
+    start_s, end_s = ctx["period_from_s"], ctx["period_from_s"] + ctx["period_s"]
+    covered = round((max(stamps) + 3600 - min(stamps)) / 86400, 1) if stamps else None
+    partial = bool(stamps) and min(stamps) > start_s + 86400
+    if partial:
+        ctx["gaps"].append("Traffic: application data covers only {} to {} UTC of the period; the Orchestrator keeps hourly application statistics for about 14 days, "
+                           "so the totals are for that part only and are not compared with the period before.".format(
+                               datetime.fromtimestamp(min(stamps), timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(min(max(stamps), end_s), timezone.utc).strftime("%Y-%m-%d")))
+    change = round(100.0 * (total - previous) / previous, 2) if read_before and previous and not partial else None
     status = "green" if read_now else "grey"
     sections: Dict[str, Dict[str, Any]] = {}
     m_total = metric("wan_bytes_total", total if read_now else None, "bytes", "WAN traffic, sent and received")
     m_change = metric("wan_bytes_change_pct", change, "%", "Change against the previous period of the same length")
     m_top = metric("top_app_share_pct", app_rows[0]["share_pct"] if app_rows else None, "%", "Largest application's share of WAN traffic")
     m_apps = metric("applications_seen", len(app_rows), "applications", "Applications with traffic")
+    m_days = metric("traffic_days_covered", covered, "days", "Days of the period with application data")
     sections["traffic-apps"] = {"status": status, "metrics": [m_apps, m_top], "table": app_rows,
                                 "chart": {"title": "Share of WAN traffic by application, % (largest 15)", "zoom": False,
                                           "points": [(r["application"], r["share_pct"]) for r in app_rows[:15] if r["share_pct"] is not None]}}
@@ -1287,7 +1300,7 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         walk(data.get("classes:" + str(ne)))
     rows = _shares(classes, "traffic_class")
     sections["traffic-classes"] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": ["Traffic classes as defined in the QoS (shaper) policy, all traffic types."]}
-    sections["traffic-summary"] = {"status": status, "metrics": [m_total, m_change, m_top, m_apps]}
+    sections["traffic-summary"] = {"status": status, "metrics": [m_total, m_change, m_top, m_apps, m_days]}
     if read_now and not read_before:
         ctx["gaps"].append("Traffic: the previous period could not be read, so the change is not shown.")
     return sections
