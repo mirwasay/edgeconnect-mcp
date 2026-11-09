@@ -13,7 +13,7 @@ edgeconnect_mcp = ["op_notes.json", "cards.json"]
 
 [project]
 name = "edgeconnect-mcp"
-version = "0.4.2"
+version = "0.5.0"
 description = "Secure MCP server for the HPE Aruba EdgeConnect Orchestrator REST API, with a report command"
 readme = "README.md"
 license = { file = "LICENSE" }

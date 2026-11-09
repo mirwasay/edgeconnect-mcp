@@ -1,6 +1,6 @@
 {
   "name": "edgeconnect-mcp",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Secure MCP server for the HPE Aruba EdgeConnect Orchestrator REST API, with a report command (runs the bundled Python server)",
   "license": "Apache-2.0",
   "bin": { "edgeconnect-mcp": "bin/edgeconnect-mcp.js" },
