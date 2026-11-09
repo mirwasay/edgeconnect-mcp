@@ -8,6 +8,7 @@ validate checks narrative.json: numbers only as {{m:<metric id>}} tokens, known 
 render   writes one self-contained HTML5 file (inline CSS and SVG, no JavaScript).
 """
 import argparse
+import bisect
 import calendar
 import hashlib
 import html
@@ -33,7 +34,8 @@ STATUSES = ("green", "amber", "red", "grey")
 REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations", "optimisation", "security", "activity")
 SECTIONS = {
     "availability": (("avail-summary", "Availability summary"), ("avail-appliances", "Appliance reachability"),
-                     ("avail-tunnels", "Tunnel availability"), ("avail-paths", "Path quality"), ("avail-alarms", "Alarms in the period"), ("data-gaps", "Data gaps")),
+                     ("avail-roles", "Hubs and branches"), ("avail-tunnels", "Tunnel availability"), ("avail-interfaces", "Interface availability"),
+                     ("avail-paths", "Path quality"), ("avail-alarms", "Alarms in the period"), ("data-gaps", "Data gaps")),
     "noc": (("noc-summary", "NOC summary"), ("noc-appliances", "Appliance state"), ("noc-alarms", "Active alarms"), ("noc-health", "Health"),
             ("noc-tunnels", "Tunnels down"), ("noc-worst", "Sites needing attention"), ("data-gaps", "Data gaps")),
     "capacity": (("cap-summary", "WAN capacity summary"), ("cap-links", "WAN links by P95 utilisation"), ("data-gaps", "Data gaps")),
@@ -66,10 +68,11 @@ INCIDENT_LOOKBACK_MS = 24 * 3600000  # changes in the 24 hours before an inciden
 INCIDENT_MAX_APPLIANCES = 20
 INCIDENT_MAX_MS = 7 * 86400000  # longer windows are periods, not incidents (and the minute reachability is read per day)
 AUDIT_PAGE = 10000  # GET /action returns at most this many entries, newest first
-AUDIT_MAX_PAGES = 50  # activity report: at most this many pages (500,000 changes) before the rest is a named gap
+AUDIT_MAX_PAGES = 100  # activity report: at most this many pages (1,000,000 changes) before the rest is a named gap
 # The executive page's KPI strip: availability, overlays, sites below target, critical alarms, licence, capacity, NOC, advisories.
 EXEC_KPIS = ("fleet_reach_pct", "paths_ok_pct", "wan_bytes_total", "worst_p95_pct", "active_critical", "license_days_left")
 PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle", "traffic", "paths"), "operations": ("noc", "paths", "capacity")}  # reports that combine others; the rest are themselves
+ROLE_NAMES = {"0": "branch", "1": "hub", "2": "mesh"}  # GET /appliance `networkRole`
 STATE_NAMES = {1: "normal", 2: "unreachable", 3: "unsupported", 4: "out of sync", 5: "syncing"}  # GET /appliance `state`
 GOOD_HEALTH = ("HEALTHY",)  # POST /health hourly `status` that counts as good; the spec enum is HEALTHY, WARNING, MINOR, MAJOR, CRITICAL
 WAN_INTERFACE = re.compile(r"^b?wan\d", re.I)  # WAN ports and their VLANs (wan0, wan1.20, bwan0) in POST /stats/aggregate/interface
@@ -299,6 +302,7 @@ def _collect_availability(c: Collector, nepks: List[str], first: date, start_ms:
         c.call("reach:" + ne, "/stats/aggregate/availability/appliance", {"nePk": ne, "date": first.isoformat(), "granularity": "month"})
         c.call("overlay:" + ne, "/stats/aggregate/availability/tunnel", {"nePk": ne, "date": first.isoformat(), "granularity": "month", "overlayId": "all"})
         c.call("underlay:" + ne, "/stats/aggregate/availability/tunnel", {"nePk": ne, "date": first.isoformat(), "granularity": "month", "overlayId": "0"})
+        c.call("ifavail:" + ne, "/stats/aggregate/availability/interface", {"nePk": ne, "date": first.isoformat(), "granularity": "month"})
         c.call("alarm_period:" + ne, "/health/alarmPeriodSummary", {"applianceId": ne, "from": start_ms, "to": end_ms})
         # Path quality per tunnel over the period: aggregate stats take epoch seconds, daily buckets are kept for months.
         c.call("paths:" + ne, "/stats/aggregate/tunnel", {"nePk": ne, "startTime": start_ms // 1000, "endTime": end_ms // 1000, "granularity": "day"})
@@ -846,6 +850,41 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     alarm_ids = [metric("alarms_" + sev.lower(), counts[sev] if have_alarms else None, "alarms", sev.title() + " alarms in the period") for sev in counts]
     sections["avail-alarms"] = {"status": alarm_status, "metrics": alarm_ids, "table": alarm_rows, "notes": ["Source: " + source + "."]}
 
+    # Interfaces: like tunnels, `count` is minute samples and `state` is seconds down (9.7.1, 10.0).
+    if_limits = _target_limits(ctx, "interfaceAvailability" if "interfaceAvailability" in threshold else "reachability")
+    if_rows = []
+    for ne, name in names.items():
+        for row in data.get("ifavail:" + str(ne)) or []:
+            if isinstance(row, dict) and row.get("count"):
+                seconds = 60.0 * float(row["count"])
+                pct = _pct(seconds - min(seconds, float(row.get("state") or 0)), seconds)
+                if_rows.append({"appliance": name, "interface": row.get("ifname"), "label": "" if row.get("label") in (None, "none") else row.get("label"),
+                                "availability_pct": pct, "status": band(pct, if_limits)})
+    if_rows.sort(key=lambda r: (r["availability_pct"] if r["availability_pct"] is not None else 101, str(r["appliance"])))
+    # Interfaces up less than 1% of the period are unused or unplugged ports, as down-all-period tunnels are: listed apart unless --down-tunnels include.
+    unused = [r for r in if_rows if r["availability_pct"] is not None and r["availability_pct"] < 100 * (1 - ALWAYS_DOWN)]
+    if separate:
+        if_rows = [r for r in if_rows if r not in unused]
+    below_if = sum(r["status"] in ("amber", "red") for r in if_rows)
+    if_notes = ["Every interface with samples, lowest first (WAN, LAN and virtual)."]
+    if unused:
+        if_notes.append("{} interfaces were up less than 1% of the period, usually unused or unplugged ports, {}: {}.".format(
+            len(unused), "listed here and left out of the table and status" if separate else "counted in the table and status",
+            "; ".join("{} {}".format(r["appliance"], r["interface"]) for r in unused)))
+    sections["avail-interfaces"] = {"status": worst([r["status"] for r in if_rows]) if if_rows else "grey", "table": if_rows,
+                                    "metrics": [metric("interfaces_below_target", below_if if if_rows else None, "interfaces", "Interfaces below the availability target"),
+                                                metric("interfaces_unused", len(unused), "interfaces", "Interfaces up less than 1% of the period")],
+                                    "notes": if_notes}
+    # Hubs and branches: the same reachability minutes, grouped by the appliance's network role.
+    role_of = {a.get("nePk"): ROLE_NAMES.get(str(a.get("networkRole")), "unknown role") for a in inventory if a.get("networkRole") is not None}
+    by_role: Dict[str, List[float]] = {}
+    for ne in names:
+        sample = (data.get("reach:" + str(ne)) or [{}])[0] if isinstance(data.get("reach:" + str(ne)), list) else {}
+        if sample.get("samplecount") and ne in role_of:
+            r = by_role.setdefault(role_of.get(ne, "unknown"), [0.0, 0.0, 0])
+            r[0], r[1], r[2] = r[0] + float(sample.get("appliancereachability") or 0), r[1] + float(sample["samplecount"]), r[2] + 1
+    role_rows = [{"role": role, "appliances": int(v[2]), "reachability_pct": _pct(v[0], v[1]), "status": band(_pct(v[0], v[1]), limits)} for role, v in sorted(by_role.items())]
+    sections["avail-roles"] = {"status": worst([r["status"] for r in role_rows]) if role_rows else "grey", "metrics": [], "table": role_rows}
     sections["avail-paths"] = _paths(ctx)
     availability_status = worst([sections["avail-appliances"]["status"], sections["avail-tunnels"]["status"], sections["avail-paths"]["status"]])
     sections["avail-summary"] = {"status": availability_status, "metrics": [m_fleet, "overlay_avail_pct", "underlay_avail_pct", "alarms_critical", "appliances_total"]}
@@ -1012,8 +1051,17 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         gaps.append("Changes: GET /action could not be read.")
     if data.get("activity_audit_full"):
         gaps.append("Changes: {} pages of the audit log were read ({} entries); older changes in the window are not listed.".format(AUDIT_MAX_PAGES, AUDIT_MAX_PAGES * AUDIT_PAGE))
-    changes = [{"time": _when(r.get("queuedTime")), "user": r.get("user"), "appliance": names.get(r.get("nepk"), r.get("nepk") or ""), "change": r.get("name"),
-                "result": "failed" if _failed(r) else "ok"} for r in sorted(audit or [], key=lambda r: -(r.get("queuedTime") or 0))]
+    # Busy Orchestrators log hundreds of thousands of automatic changes a week, so changes are grouped (every group listed), not one row each.
+    groups: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in audit or []:
+        g = groups.setdefault((str(r.get("user") or ""), str(r.get("name") or "")), {"user": r.get("user"), "change": r.get("name"), "times": 0, "failed": 0,
+                                                                                   "appliances": set(), "last": 0})
+        g["times"] += 1
+        g["failed"] += _failed(r)
+        g["appliances"].add(r.get("nepk"))
+        g["last"] = max(g["last"], r.get("queuedTime") or 0)
+    changes = [{"user": g["user"], "change": g["change"], "times": g["times"], "failed": g["failed"], "appliances": len(g["appliances"] - {None, ""}),
+                "last": _when(g["last"])} for g in sorted(groups.values(), key=lambda g: (-g["failed"], -g["times"]))]
     by_type: Dict[Tuple[str, str], int] = {}
     repeat: Dict[Tuple[Any, str], int] = {}
     for a in alarms:
@@ -1022,21 +1070,28 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         repeat[(a.get("applianceId"), name)] = repeat.get((a.get("applianceId"), name), 0) + 1
     type_rows = [{"alarm": n, "severity": sev, "times": k} for (n, sev), k in sorted(by_type.items(), key=lambda i: (SEVERITY_ORDER.get(i[0][1], 9), -i[1]))]
     repeat_rows = [{"appliance": names.get(ne, ne), "alarm": n, "times": k} for (ne, n), k in sorted(repeat.items(), key=lambda i: -i[1]) if k >= 3]
+    changes_by_ne: Dict[Any, List[Tuple[int, str]]] = {}
+    for r in audit or []:
+        changes_by_ne.setdefault(r.get("nepk"), []).append((int(r.get("queuedTime") or 0), str(r.get("name") or "")))
+    for times in changes_by_ne.values():
+        times.sort()
     after = []
-    for a in alarms:  # raised within an hour after a change on the same appliance
-        raised = a.get("timeOccurredInMills") or 0
-        hit = next((r for r in audit or [] if r.get("nepk") == a.get("applianceId") and 0 <= raised - (r.get("queuedTime") or 0) <= 3600000), None)
-        if hit:
-            after.append({"appliance": names.get(a.get("applianceId")), "alarm": str(a.get("name") or ""), "raised": _when(raised), "after_change": hit.get("name")})
+    for a in alarms:  # raised within an hour after a change on the same appliance (the latest such change is named)
+        raised = int(a.get("timeOccurredInMills") or 0)
+        times = changes_by_ne.get(a.get("applianceId"), [])
+        i = bisect.bisect_right(times, (raised, "\uffff")) - 1
+        if i >= 0 and raised - times[i][0] <= 3600000:
+            after.append({"appliance": names.get(a.get("applianceId")), "alarm": str(a.get("name") or ""), "raised": _when(raised), "after_change": times[i][1]})
     to_clear = sorted((a["clearedTimeInMills"] - a["timeOccurredInMills"]) / 60000.0 for a in alarms
                       if isinstance(a.get("clearedTimeInMills"), (int, float)) and a["clearedTimeInMills"] > 0 and isinstance(a.get("timeOccurredInMills"), (int, float)))
-    failed = sum(r["result"] == "failed" for r in changes)
-    ids = [metric("act_changes", len(changes) if audit is not None else None, "changes", "Changes in the audit log"),
+    failed = sum(r["failed"] for r in changes)
+    ids = [metric("act_changes", sum(r["times"] for r in changes) if audit is not None else None, "changes", "Changes in the audit log"),
            metric("act_changes_failed", failed if audit is not None else None, "changes", "Changes that failed", "amber" if failed else "green"),
            metric("act_alarms", len(alarms), "alarms", "Alarms raised"), metric("act_repeat", len(repeat_rows), "alarms", "Alarms raised 3 or more times on one appliance"),
            metric("act_median_clear_min", round(statistics.median(to_clear), 1) if to_clear else None, "minutes", "Median time to clear")]
     return {"act-summary": {"status": "amber" if failed or repeat_rows else "green", "metrics": ids},
-            "act-changes": {"status": "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes},
+            "act-changes": {"status": "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes,
+                            "notes": ["Changes grouped by user and type, those with failures first; system users such as OverlayManager are the Orchestrator's own automation."]},
             "act-alarms": {"status": "green", "metrics": [], "table": type_rows},
             "act-repeat": {"status": "amber" if repeat_rows else "green", "metrics": [], "table": repeat_rows, "notes": ["An alarm raised 3 or more times on one appliance in the window."]},
             "act-after-change": {"status": "amber" if after else "green", "metrics": [], "table": after,

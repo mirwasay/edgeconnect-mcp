@@ -14,7 +14,8 @@ PATHS = ["/gms/versions", "/appliance", "/stats/config/availabilityThreshold", "
          "/stats/aggregate/availability/tunnel", "/health/alarmPeriodSummary", "/alarm/summary", "/gmsLicense", "/license/portal/summary",
          "/alarm/count/appliance", "/gms/stats/nonStatsTable/retention", "/maintenanceMode", "/tunnels2/physical", "/tunnels2/bonded",
          "/stats/timeseries/interfaceOverlay", "/stats/timeseries/interface", "/license/portal/appliance", "/appliance/backup",
-         "/health/healthThresholdConfig", "/stats/aggregate/tunnel", "/action", "/stats/timeseries/availability/appliance", "/alarm/correlatedAlarms"]
+         "/health/healthThresholdConfig", "/stats/aggregate/tunnel", "/action", "/stats/timeseries/availability/appliance", "/alarm/correlatedAlarms",
+         "/stats/aggregate/availability/interface"]
 POSTS = ["/alarm/appliance", "/health", "/stats/aggregate/interface"]
 SPEC = {"swagger": "2.0", "basePath": "/gms/rest", "paths": dict({p: {"get": {"summary": p}} for p in PATHS}, **{p: {"post": {"summary": p}} for p in POSTS})}
 APPLIANCES = [{"nePk": "1.NE", "hostName": "branch-a", "state": 1, "model": "EC-V", "softwareVersion": "9.6.2.1_1", "serial": "SN-0001"},
@@ -851,7 +852,7 @@ class LayoutTests(unittest.TestCase):
         marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
                  'data-section-id="avail-summary"', "<footer>"]
         self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
-        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # the title is the message
+        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # appliances, tunnels, alarms and the summary  # the title is the message
         self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
         self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
 
@@ -1076,6 +1077,7 @@ class MoreReportTests(unittest.TestCase):
         alarms = [alarm(1, 10 * hour + 60000), alarm(2, 30 * hour), alarm(3, 40 * hour), alarm(4, 50 * hour, "CRITICAL", "2.NE", "Disk")]
         m = report.compute(phase2_bundle("activity", activity_audit=audit, activity_alarms=alarms))
         self.assertEqual((m["metrics"]["act_changes"]["value"], m["metrics"]["act_changes_failed"]["value"], m["metrics"]["act_alarms"]["value"]), (2, 1, 4))
+        self.assertEqual([(r["change"], r["times"], r["failed"]) for r in m["sections"]["act-changes"]["table"]], [("Reboot", 1, 1), ("Apply Appliance Template", 1, 0)])
         self.assertEqual(m["sections"]["act-repeat"]["table"][0], {"appliance": "branch-a", "alarm": "Tunnel down", "times": 3})
         self.assertEqual([r["alarm"] for r in m["sections"]["act-after-change"]["table"]], ["Tunnel down"])  # raised within an hour of a change on the same appliance
 
@@ -1104,6 +1106,25 @@ class MoreReportTests(unittest.TestCase):
 
     def test_new_reports_default_to_the_last_7_days(self):
         self.assertEqual([report.DEFAULT_PERIOD[r] for r in ("optimisation", "security", "activity")], ["last-7-days"] * 3)
+
+
+class AvailabilityReworkTests(unittest.TestCase):
+    """Availability adds interfaces (WAN ports) and a hub / branch roll-up."""
+
+    def test_interfaces_and_roles(self):
+        apps = [dict(APPLIANCES[0], networkRole="1"), dict(APPLIANCES[1], networkRole="0")]
+        ifaces = [{"nepk": "1.NE", "ifname": "wan0", "label": "INETA", "state": 600, "count": 1000}, {"nepk": "1.NE", "ifname": "lan0", "label": "none", "state": 0, "count": 1000}]
+        b = bundle(appliances=apps, **{"ifavail:1.NE": ifaces})
+        b["data"]["availability_threshold"]["interfaceAvailability"] = {"goodLimit": 99.0, "okLimit": 99.9}
+        m = report.compute(b)
+        rows = {r["interface"]: (r["availability_pct"], r["status"]) for r in m["sections"]["avail-interfaces"]["table"]}
+        self.assertEqual(rows, {"wan0": (99.0, "amber"), "lan0": (100.0, "green")})  # 600 s down of 1,000 minutes
+        ifaces.append({"nepk": "1.NE", "ifname": "lan1", "label": "none", "state": 59900, "count": 1000})  # up 0.2% of the period: an unused port
+        m = report.compute(bundle(appliances=apps, **{"ifavail:1.NE": ifaces}))
+        self.assertNotIn("lan1", [r["interface"] for r in m["sections"]["avail-interfaces"]["table"]])
+        self.assertEqual(m["metrics"]["interfaces_unused"]["value"], 1)
+        roles = {r["role"]: r["reachability_pct"] for r in m["sections"]["avail-roles"]["table"]}
+        self.assertEqual(roles, {"hub": 99.5, "branch": 100.0})
 
 
 class HealthByCategoryTests(unittest.TestCase):

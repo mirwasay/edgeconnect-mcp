@@ -11,7 +11,7 @@ description: Use when the user asks for an EdgeConnect or Orchestrator report (m
 
 | Ask | `--report` | Sections |
 | --- | --- | --- |
-| availability, service level, uptime, monthly SLA, loss, latency, jitter, MOS | `availability` | summary, appliance reachability, tunnel availability (overlay and underlay), path quality per tunnel, alarms in the period, data gaps |
+| availability, service level, uptime, monthly SLA, loss, latency, jitter, MOS | `availability` | summary, appliance reachability, hubs and branches, tunnel availability (overlay and underlay), interface availability, path quality per tunnel, alarms in the period, data gaps |
 | NOC digest, what is broken now, daily ops, worst sites | `noc` | appliance state, active alarms, health (last 24 hours and 7 days), tunnels down, sites needing attention |
 | WAN capacity, link utilisation, bandwidth, P95, upgrade circuits | `capacity` | WAN links ranked by P95 utilisation against configured bandwidth, with each link's peak hour, change in average load against the previous period, and for busy links the appliance's largest applications |
 | lifecycle, licences, backups, software versions, vulnerabilities, advisories, CVE | `lifecycle` | inventory and ECOS trains, licence expiry, last backups, known advisories, hardware end of life (grey: no API) |
@@ -20,7 +20,7 @@ description: Use when the user asks for an EdgeConnect or Orchestrator report (m
 | path quality, voice and video quality, tunnel performance, FEC, compare transports | `paths` | summary, every active path worst first (loss before and after FEC, latency, jitter, MOS), loss hidden by FEC, underlay transports compared |
 | WAN optimisation savings, data reduction, what optimisation saves | `optimisation` | summary and reduction by appliance (optimised traffic: LAN bytes against WAN bytes) |
 | firewall drops, zone traffic, security policy hits | `security` | summary and every zone pair with flows allowed and dropped, policy and routing drops |
-| what changed, change log, alarm load, repeating alarms, alarms after changes | `activity` | changes from the audit log (every page), alarms by type, alarms raised 3 or more times on one appliance, alarms within an hour of a change |
+| what changed, change log, alarm load, repeating alarms, alarms after changes | `activity` | changes from the audit log (every page, grouped by user and type, failures first), alarms by type, alarms raised 3 or more times on one appliance, alarms within an hour of a change |
 | weekly operations summary, team lead review, what needs doing this week | `operations` | appliance state, active alarms, health by category, tunnels down, worst paths, busiest WAN links, one list of recommended actions (default last 7 days) |
 | executive summary, one-pager, management report | `executive` | verdict and six headline figures (availability, paths within thresholds, WAN traffic, busiest link, critical alarms, licence days), then fleet, availability, active alarms, licensing, software, WAN capacity, NOC digest, path quality, WAN traffic, lifecycle, and one list of recommended actions |
 
