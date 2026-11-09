@@ -358,13 +358,13 @@ class PresentationTests(unittest.TestCase):
     def test_executive_verdict_and_kpi_strip(self):
         m = self.executive(down=1, alarm_summary={"numOfCriticalAlarms": 2, "numOfMajorAlarms": 0, "numOfMinorAlarms": 0, "numOfWarningAlarms": 0})
         self.assertEqual(m["headline"]["status"], "red")
-        self.assertTrue(m["headline"]["text"].startswith("Overall: Red. Attention needed in Fleet"))
+        self.assertTrue(m["headline"]["text"].startswith("Overall: Critical. Attention needed in Fleet"))  # the layout's status words
         self.assertIn("Active alarms", m["headline"]["text"])
         self.assertEqual(m["headline"]["kpis"], list(report.EXEC_KPIS))
         page = report.render(m)
         self.assertLess(page.index('data-section-id="verdict"'), page.index('data-section-id="exec-fleet"'))
         self.assertIn('data-section-id="kpi-strip"', page)
-        self.assertIsNone(report.compute(bundle())["headline"])  # only the executive page has one
+        self.assertIsNone(report.compute(bundle())["headline"])  # only the summary reports have one
 
     def test_availability_summary_follows_availability_not_alarms(self):
         m = report.compute(bundle(appliance_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}]))
@@ -1013,6 +1013,29 @@ class CapacityPlanningTests(unittest.TestCase):
         self.assertEqual(len(posts), 2)
         self.assertEqual(posts[1]["endTime"], posts[0]["startTime"])  # the previous period, same length
         self.assertEqual(sorted(c[2]["nePk"] for c in client.calls if c[1] == "/stats/aggregate/application2"), ["1.NE", "2.NE"])
+
+
+class SummaryReportTests(unittest.TestCase):
+    """C1 executive and C2 operations: stitched from the other reports' sections, so their numbers always match."""
+
+    def test_executive_adds_traffic_paths_and_one_action_list(self):
+        data = TrafficTests().data()
+        data["active_alarms"] = [{"applianceId": "1.NE", "severity": "CRITICAL"}]
+        m = report.compute(phase2_bundle("executive", **data))
+        self.assertEqual(report.EXEC_KPIS, ("fleet_reach_pct", "paths_ok_pct", "wan_bytes_total", "worst_p95_pct", "active_critical", "license_days_left"))
+        self.assertEqual(m["metrics"]["wan_bytes_total"]["value"], 2000)  # the same figure the traffic report computes
+        self.assertIn("exec-traffic", m["sections"])
+        self.assertIn("exec-paths", m["sections"])
+        actions = [a["id"] for a in m["sections"]["exec-actions"]["actions"]]
+        self.assertIn("triage_critical", actions)
+        self.assertEqual(len(actions), len(set(actions)))
+
+    def test_operations_summary_stitches_noc_paths_and_capacity(self):
+        self.assertEqual(report.PARTS["operations"], ("noc", "paths", "capacity"))
+        self.assertEqual(report.DEFAULT_PERIOD["operations"], "last-7-days")
+        m = report.compute(phase2_bundle("operations", active_alarms=[{"applianceId": "1.NE", "severity": "MAJOR"}]))
+        self.assertEqual([sid for sid in m["sections"]], [sid for sid, _ in report.SECTIONS["operations"]])
+        self.assertEqual(m["sections"]["ops-alarms"]["status"], "amber")
 
 
 class HealthByCategoryTests(unittest.TestCase):
