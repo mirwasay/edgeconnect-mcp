@@ -178,7 +178,10 @@ edgeconnect-mcp report render rep/metrics.json rep/narrative.json --out rep/repo
 
 | Option | Values |
 |---|---|
-| `--report` | `availability`, `noc`, `capacity`, `lifecycle`, `incident`, `executive`, `traffic`, `paths`, `operations`, `optimisation`, `security`, `activity`, `site` (needs `--scope` with one appliance), `custom` (needs `--parts`) |
+| `--report` | `availability`, `noc`, `capacity`, `lifecycle`, `incident`, `executive`, `traffic`, `paths`, `operations`, `optimisation`, `security`, `activity`, `site` (needs `--scope` with one appliance), `custom` (needs `--parts`), `health` |
+| `--traffic-type` | traffic: `all_traffic` (default), `optimized_traffic`, `pass_through_shaped`, `pass_through_unshaped` |
+| `--overlay` | paths: one overlay id (default: every overlay) |
+| `--threshold` | capacity: planning limit in % (default: the Orchestrator's bwUtilization limits) |
 | `--period` | `last-month` (default) or `month-to-date`; or `--month YYYY-MM`; for `traffic`, `paths`, `operations`, `optimisation`, `security` and `activity`, `last-7-days` (their default) or `last-24-hours` |
 | `--scope` | `all` (default), or comma-separated nePks or host names |
 | `--target` | `orchestrator` (default: its configured thresholds), `99.5`, `99.9` or `99.99` |

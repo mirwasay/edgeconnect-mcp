@@ -36,7 +36,10 @@ section{background:var(--surface);border:1px solid var(--ring);border-radius:8px
 .summary{font-size:15px;margin:8px 0 4px}
 figure{margin:8px 0}svg.chart{width:100%;height:auto;display:block}
 svg text{font-family:inherit}svg .lbl{fill:var(--ink);font-size:12px}svg .val,svg .axis{fill:var(--ink2);font-size:11px;font-variant-numeric:tabular-nums}
-svg .bar{fill:var(--series)}svg .base{stroke:var(--base);stroke-width:1}
+svg .bar{fill:var(--series)}svg .base{stroke:var(--base);stroke-width:1}svg .grid{stroke:var(--grid);stroke-width:1}svg .threshold{stroke:var(--critical);stroke-width:1}
+svg .band1{fill:#c3c2b7}svg .band2{fill:#d4d3cb}svg .band3{fill:#e6e5df}svg .actual{fill:var(--ink)}svg .target{stroke:var(--ink);stroke-width:2}
+.legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:var(--ink2);margin-top:4px}.legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:6px}
+nav.next{font-size:13px;color:var(--ink2);border-top:1px solid var(--grid);padding-top:8px;margin-top:10px}
 svg .cell.good{fill:var(--good)}svg .cell.warning{fill:var(--warning)}svg .cell.critical{fill:var(--critical)}svg .cell.nodata{fill:var(--nodata)}
 svg .icon{fill:#fff;font-size:12px;font-weight:700}svg .icon.warning,svg .icon.nodata{fill:#0b0b0b}
 details.tbl summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:6px}
@@ -115,12 +118,75 @@ def grid(title: str, rows: Sequence[Tuple[str, Sequence[Tuple[str, Optional[str]
         x0 + len(columns) * cw + 4, 26 + len(rows) * rh, esc(title), esc(title), "".join(parts))
 
 
+SERIES = ("var(--series)", "#eb6834", "#1baf7a")  # validated categorical slots 1-3; never more than three series in one chart
+
+
+def bullets(title: str, items: Sequence[Tuple[str, Optional[float], float, Tuple[float, float]]], low: float, high: float) -> str:
+    """Bullet graphs (Stephen Few): grey bands below / between / above the two limits, a dark bar for the value, a line for the target."""
+    width, row, x0, x1 = 760, 30, 230, 700
+    sx = lambda v: x0 + (min(max(v, low), high) - low) / (high - low) * (x1 - x0)
+    parts = []
+    for i, (label, value, target, limits) in enumerate(items):
+        y = 6 + i * row
+        a, b = sorted(limits)
+        bands = "".join('<rect class="band{}" x="{:.1f}" y="{}" width="{:.1f}" height="20"/>'.format(k, sx(f), y, max(0.0, sx(t) - sx(f)))
+                        for k, (f, t) in enumerate(((low, a), (a, b), (b, high)), 1))
+        bar = '<rect class="actual" x="{}" y="{}" width="{:.1f}" height="8" rx="2"/>'.format(x0, y + 6, sx(value) - x0) if value is not None else ""
+        shown = "no data" if value is None else "{:.3f}%".format(value)
+        parts.append('<g><title>{0}: {1} (target {2:.3f}%)</title><text class="lbl" x="{3}" y="{4}" text-anchor="end">{0}</text>{5}{6}'
+                     '<line class="target" x1="{7:.1f}" x2="{7:.1f}" y1="{8}" y2="{9}"/><text class="val" x="{10}" y="{4}">{1}</text></g>'.format(
+                         esc(label), shown, target, x0 - 8, y + 14, bands, bar, sx(target), y + 2, y + 18, x1 + 6))
+    return ('<figure><svg class="chart" viewBox="0 0 {0} {1}" role="img" aria-label="{2}"><title>{2}</title>{3}</svg>'
+            '<figcaption class="legend">Dark bar: actual. Line: target. Bands: below {4:g}%, {4:g} to {5:g}%, above {5:g}%.</figcaption></figure>').format(
+        width + 60, 12 + len(items) * row, esc(title), "".join(parts), *sorted(items[0][3])) if items else ""
+
+
+def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], unit: str, threshold: Optional[float] = None) -> str:
+    """Time series on one y axis: up to three series in fixed colours, a labelled threshold line, round axis ticks, a legend."""
+    if len(series) > len(SERIES):
+        raise ValueError("a line chart takes at most {} series".format(len(SERIES)))
+    if not series or not series[0][1]:
+        return ""
+    width, height, x0, x1, y0, y1 = 760, 220, 72, 740, 190, 14
+    labels = [p[0] for p in series[0][1]]
+    peak = max([v for _, pts in series for _, v in pts] + ([threshold] if threshold is not None else []) + [0.0])
+    step = 10 ** max(0, len("{:.0f}".format(peak)) - 1) / 2 or 1.0
+    top = max(step, -(-peak * 1.1 // step) * step)
+    sx = lambda i: x0 + (i * (x1 - x0) / (len(labels) - 1) if len(labels) > 1 else (x1 - x0) / 2)
+    sy = lambda v: y0 - v / top * (y0 - y1)
+    parts = []
+    for k in range(5):
+        v = top * k / 4
+        tick = human_bytes(v) if unit == "bytes" else "{:g}".format(round(v, 2))
+        parts.append('<line class="grid" x1="{0}" x2="{1}" y1="{2:.1f}" y2="{2:.1f}"/><text class="axis" x="{3}" y="{4:.1f}" text-anchor="end">{5}</text>'.format(
+            x0, x1, sy(v), x0 - 6, sy(v) + 4, tick))
+    every = max(1, len(labels) // 8)
+    parts += ['<text class="axis" x="{:.1f}" y="{}" text-anchor="{}">{}</text>'.format(sx(i), y0 + 18, "end" if i == len(labels) - 1 else "middle", esc(l))
+              for i, l in enumerate(labels) if i % every == 0]  # the last label ends at the axis, not past it
+    if threshold is not None:
+        parts.append('<line class="threshold" x1="{0}" x2="{1}" y1="{2:.1f}" y2="{2:.1f}"/><text class="axis" x="{1}" y="{3:.1f}" text-anchor="end">threshold {4:g}{5}</text>'.format(
+            x0, x1, sy(threshold), sy(threshold) - 5, threshold, esc(unit)))
+    for k, (name, pts) in enumerate(series):
+        coords = " ".join("{:.1f},{:.1f}".format(sx(i), sy(v)) for i, (_, v) in enumerate(pts))
+        parts.append('<polyline fill="none" stroke="{}" stroke-width="2" points="{}"><title>{}</title></polyline>'.format(SERIES[k], coords, esc(name)))
+    legend = "".join('<span><i style="background:{}"></i>{}</span>'.format(SERIES[k], esc(name)) for k, (name, _) in enumerate(series))
+    return ('<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg><figcaption class="legend">{}</figcaption></figure>').format(
+        width, height + 10, esc(title), esc(title), "".join(parts), legend)
+
+
 def human_bytes(n: float) -> str:
     """Decimal units (1 GB = 10^9 bytes)."""
     for unit, size in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
         if abs(n) >= size:
             return "{:.2f} {}".format(n / size, unit)
     return "{:.0f} bytes".format(n)
+
+
+def number(column: str, value: float) -> str:
+    """Fixed formats: availability and reachability to 3 decimals, other percentages to 1, everything else 2."""
+    if any(k in column for k in ("avail", "reach")):
+        return "{:,.3f}".format(value)
+    return "{:,.1f}".format(value) if column.endswith("_pct") else "{:,.2f}".format(value)
 
 
 def cell(value: Any) -> Tuple[str, bool]:
@@ -150,14 +216,15 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
             if c == "status":
                 tds.append("<td>{}</td>".format(pill(r.get(c))))
                 continue
-            text = human_bytes(r[c]) if c.endswith("bytes") and c in numeric and r.get(c) is not None else cell(r.get(c))[0]
+            v = r.get(c)
+            text = human_bytes(v) if c.endswith("bytes") and c in numeric and v is not None else number(c, v) if isinstance(v, float) else cell(v)[0]
             tds.append('<td class="{}">{}</td>'.format("n" if c in numeric else "", esc(text)))
         body.append("<tr>{}</tr>".format("".join(tds)))
     return '<div class="tablewrap"><table><thead><tr>{}</tr></thead><tbody>{}</tbody></table></div>'.format(head, "".join(body))
 
 
 def section(sid: str, number: int, title: str, status: str, summary: str, figure: str, stat_html: str, rows: Sequence[Mapping[str, Any]],
-            notes: Sequence[str], appendix: List[str], causes: Sequence[str] = (), actions: Sequence[str] = ()) -> str:
+            notes: Sequence[str], appendix: List[str], causes: Sequence[str] = (), actions: Sequence[str] = (), follow: Sequence[str] = ()) -> str:
     """One section, always the same anatomy: number, title, status; summary; figures; table view; notes; possible causes; actions."""
     view = ""
     if rows:
@@ -170,7 +237,8 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
     lists = (("Notes", notes), ("Possible causes", causes), ("Recommended actions", actions))
     note_html = "".join('<div class="notes"><h3>{}</h3><ul>{}</ul></div>'.format(h, "".join("<li>{}</li>".format(esc(i)) for i in items)) for h, items in lists if items)
     return ('<section id="{0}" data-section-id="{0}" aria-labelledby="{0}-h"><header class="sec-head"><span class="num">{1}</span><h2 id="{0}-h">{2}</h2>{3}</header>'
-            '{4}{5}{6}{7}{8}</section>').format(esc(sid), number, esc(title), pill(status), summary, stat_html, figure, view, note_html)
+            '{4}{5}{6}{7}{8}{9}</section>').format(esc(sid), number, esc(title), pill(status), summary, stat_html, figure, view, note_html,
+                                                   '<nav class="next" aria-label="Follow-up reports">Next: {}</nav>'.format(" \u00b7 ".join(esc(f) for f in follow)) if follow else "")
 
 
 def page(title: str, kind: str, facts: Sequence[Tuple[str, str]], options: str, verdict_status: str, verdict_text: str, banner: str,
