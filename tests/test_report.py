@@ -1943,9 +1943,9 @@ class Round5DefectTests(unittest.TestCase):
         self.assertIn("cleared by the time the data was collected", m["metrics"]["inc_median_clear_min"]["label"])
 
     def test_5_mos_only_rows_are_explained(self):
-        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=127)}}
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=80)}}  # MOS 0.8: outside THRESHOLDS on MOS alone
         notes = " ".join(report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))["sections"]["paths-ranked"]["notes"])
-        self.assertIn("1 tunnel is outside the thresholds on MOS alone", notes)
+        self.assertIn("On MOS alone, with loss, latency and jitter within their thresholds: 1 tunnel outside the thresholds", notes)
 
     def test_6_boost_states_its_basis(self):
         boost = [{"configured": 25000.0, "nePk": "1.NE", "boost_bytes": 2000.0, "seconds_not_boosted": 0}]
@@ -1990,6 +1990,57 @@ class Round5DefectTests(unittest.TestCase):
         backups = {"backup:1.NE": [{"backupTime": NOW - 100 * 86400}], "backup:2.NE": [{"backupTime": NOW - 40 * 86400}]}
         m = report.compute(phase2_bundle("lifecycle", **backups))
         self.assertIn("1 over 90 days or never, 1 over 30 days", m["metrics"]["backups_stale"]["label"])
+
+
+class ReviewOfRound5FixesTests(unittest.TestCase):
+    """Findings of the independent review of the round-5 fixes (2026-11-09): everything derived from path rows must follow the same rows."""
+
+    path = PersonaReviewTests.path
+
+    def site(self):
+        paths = {"a": {"1.NE": self.path("to_hub_DEFAULT", 50000, 0)}, "b": {"1.NE": self.path("to_x_DEFAULT", 50000, 0)}}
+        return phase2_bundle("health", health_threshold=THRESHOLDS, tunnels_bonded={"1.NE": {"x": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}, **{"paths:1.NE": paths})
+
+    def test_down_now_rows_change_every_count_built_from_the_rows(self):
+        m = report.compute(self.site())
+        notes = " ".join(m["sections"]["paths-ranked"]["notes"])
+        self.assertIn("2 listed = 1 within the thresholds + 1 between + 0 outside + 0 with no data", notes)
+        self.assertEqual(m["sections"]["paths-ranked"]["status"], "amber")
+        self.assertEqual(m["metrics"]["paths_amber"]["value"], 1)
+
+    def test_watch_list_names_a_down_tunnel_as_down(self):
+        rows = report.compute(self.site())["sections"]["health-watch"]["table"]
+        self.assertEqual([(r["what"], r["item"]) for r in rows], [("tunnel down now", "branch-a to_hub_DEFAULT")])
+
+    def test_consistency_compares_the_count_line_with_the_rows(self):
+        m = {"report": "paths", "metrics": {}, "section_list": [["s", "s"]], "headline": None,
+             "sections": {"s": {"status": "green", "metrics": [], "table": [{"tunnel": "t", "status": "amber"}],
+                                "notes": ["1 listed = 1 within the thresholds + 0 between + 0 outside + 0 with no data."]}}}
+        self.assertIn("s: the count line says 1 within, 0 between, 0 outside, 0 no data; the rows have 0, 1, 0, 0", report.consistency(m))
+
+    def test_mos_only_counts_split_outside_and_between_and_need_the_rest_good(self):
+        # THRESHOLDS: MOS under 1.0 is outside, 1.0 to 4.0 between
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=80)}, "b": {"1.NE": self.path("to_b", 50000, 0, mos=380)},
+                 "c": {"1.NE": self.path("to_c", 50000, 0, latency=30, mos=80)}}
+        notes = " ".join(report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))["sections"]["paths-ranked"]["notes"])
+        self.assertIn("On MOS alone, with loss, latency and jitter within their thresholds: 1 tunnel outside the thresholds and 1 between them", notes)
+
+    def test_first_note_does_not_say_mos_is_graded_when_it_is_left_out(self):
+        h = HealthByCategoryTests.hours
+        data = {"health:LOSS": {"1.NE": h("HEALTHY")}, "health:LATENCY": {"1.NE": h("HEALTHY")}, "health:JITTER": {"1.NE": h("HEALTHY")}, "health:MOS": {"1.NE": h("MAJOR")}}
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0)}}
+        notes = report.compute(phase2_bundle("health", health_threshold=THRESHOLDS, **dict(data, **{"paths:1.NE": paths})))["sections"]["paths-ranked"]["notes"]
+        self.assertNotIn("jitter and MOS against", notes[0])
+
+    def test_mos_above_the_scale_is_noted_on_its_own(self):
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=487)}}
+        notes = " ".join(report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))["sections"]["paths-ranked"]["notes"])
+        self.assertIn("1 tunnel shows MOS above 4.5", notes)
+
+    def test_links_with_a_p95_count_every_link_that_has_one(self):
+        rows = [{"status": "grey", "check": "x", "p95_out_pct": 27.0, "p95_in_pct": 1.0}, {"status": "green", "check": "", "p95_out_pct": 2.0, "p95_in_pct": None},
+                {"status": "grey", "check": "", "p95_out_pct": None, "p95_in_pct": None}]
+        self.assertEqual(report._with_p95(rows), 2)
 
 
 if __name__ == "__main__":

@@ -776,16 +776,6 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         with_stats = len(sections["paths-ranked"].get("table") or []) + len((sections["paths-ranked"].get("apart") or {}).get("rows") or [])
         sections["paths-ranked"].setdefault("notes", []).append("The tunnel state lists {:,} tunnels; {:,} {} path statistics for the period (a tunnel with no statistics "
                                                                 "in the period is not listed here).".format(listed, with_stats, "has" if with_stats == 1 else "have"))
-    if "noc-tunnels" in sections and "paths-ranked" in sections:  # a path graded over the period can be down now: say so on its row
-        down_now = {(r["appliance"], r["tunnel"]) for r in sections["noc-tunnels"].get("table") or []}
-        rows = sections["paths-ranked"].get("table") or []
-        if any((r["appliance"], r["tunnel"]) in down_now for r in rows):
-            for r in rows:
-                r["tunnel_now"] = "down" if (r["appliance"], r["tunnel"]) in down_now else ""
-                if r["tunnel_now"] and r["status"] == "green":  # good over the period, down now: not good
-                    r["status"], r["why"] = "amber", "down now"
-            _path_counts(rows, metrics)
-            sections["paths-ranked"]["notes"].append("Tunnel now: down when the tunnel is down at collection time, whatever its grade over the period.")
     for sec in sections.values():  # the figure that sets a Warning or Critical status comes first (it is what a reader and the summary cite first)
         if sec.get("status") in ("amber", "red") and sec.get("metrics"):
             sec["metrics"] = sorted(sec["metrics"], key=lambda mid: (metrics.get(mid, {}).get("status") != sec["status"], metrics.get(mid, {}).get("status") is None))
@@ -858,6 +848,11 @@ def consistency(metrics: Mapping[str, Any]) -> List[str]:
                 n = [int(x.replace(",", "")) for x in found.groups()]
                 if n[0] != sum(n[1:]):
                     problems.append("{}: '{:,} listed = {} + {} + {} + {}' does not add up".format(sid, *n))
+                rows = [r for r in sec.get("table") or [] if isinstance(r, dict) and "status" in r]
+                if rows:  # the line must describe the rows it sits under, not an earlier state of them
+                    have = [sum(r["status"] == st for r in rows) for st in ("green", "amber", "red", "grey")]
+                    if have != n[1:]:
+                        problems.append("{}: the count line says {} within, {} between, {} outside, {} no data; the rows have {}, {}, {}, {}".format(sid, *(n[1:] + have)))
             for found in _OPEN_RECONCILE.finditer(note):
                 n = [int(x.replace(",", "")) for x in found.groups()]
                 if n[0] + n[1] - n[2] != n[3]:
@@ -1109,14 +1104,23 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
                  if not (word == "MOS" and ctx.get("mos_setting"))]  # MOS left out of health on this page is left out here too
         # No loss figure (nothing received) means the path was not measured: no data, not good, whatever its probes say.
         row["status"] = "red" if row["note"] else "grey" if row["loss_pct"] is None else worst([b for b, _, _ in bands])
+        others = [b for b, word, _ in bands if word != "MOS"]
+        row["_mos_only"] = row["status"] in ("amber", "red") and not row["note"] and all(b == "green" for b in others)
+        if (row["appliance"], row["tunnel"]) in ctx.get("down_now", set()):  # graded over the period, but down at collection time: never Good
+            row["tunnel_now"] = "down"
+            if row["status"] == "green":
+                row["status"] = "amber"
         if row["status"] == "grey":  # nothing received: the probe defaults are not measurements
             row["latency_ms"] = row["jitter_ms"] = row["mos"] = None
-        row["why"] = "" if row["note"] or row["status"] in ("green", "grey") else ", ".join("{} {}".format(word, text) for b, word, text in bands if b == row["status"])
+        row["why"] = "" if row["note"] or row["status"] in ("green", "grey") else ", ".join("{} {}".format(word, text) for b, word, text in bands if b == row["status"]) or (
+            "down now" if row.get("tunnel_now") else "")
     rows.sort(key=lambda r: (-("grey", "green", "amber", "red").index(r["status"]), -(r["loss_pct"] or 0), -(r["latency_ms"] or 0)))  # no data last
     red, amber = sum(r["status"] == "red" for r in rows), sum(r["status"] == "amber" for r in rows)
     no_data = sum(r["status"] == "grey" for r in rows)
     idle = sum(1 for r in rows if r["note"]) + len(broken)
-    notes = ["Each tunnel graded on loss after FEC, latency, jitter and MOS against the Orchestrator's health thresholds: loss {} / {} %, latency {} / {} ms, jitter {} / {} ms, MOS {} / {}.".format(
+    notes = [("Each tunnel graded on loss after FEC, latency and jitter against the Orchestrator's health thresholds: loss {} / {} %, latency {} / {} ms, jitter {} / {} ms "
+              "(MOS {} / {} is not graded on this page)." if ctx.get("mos_setting") else
+              "Each tunnel graded on loss after FEC, latency, jitter and MOS against the Orchestrator's health thresholds: loss {} / {} %, latency {} / {} ms, jitter {} / {} ms, MOS {} / {}.").format(
         *(limits["packetLoss"] + limits["latency"] + limits["jitter"] + limits["mos"])),
              "Why: the measures outside the threshold that set the row's status. A tunnel that received no packets has no loss figure and is shown as No data.",
              "{:,} listed = {:,} within the thresholds + {:,} between + {:,} outside + {:,} with no data.{}".format(
@@ -1130,14 +1134,23 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
         notes.append("Under {} packets received in the period a loss % means little: a tunnel that lost probes there is shown as \"no traffic, probes lost\" and counted "
                      "red, usually a broken path or a dead configuration.".format(floor))
     apart = [{"appliance": r["appliance"], "tunnel": r["tunnel"], "kind": r["kind"], "latency_ms": r["latency_ms"]} for r in broken]
-    mos_only = sum(1 for r in rows if r.get("why", "").startswith("MOS") and "," not in r.get("why", ""))
-    if mos_only:
-        notes.append("{:,} tunnel{} outside the thresholds on MOS alone, with loss, latency and jitter within them: check the MOS thresholds "
-                     "(GET /health/healthThresholdConfig) before treating {} as a path problem. MOS is shown as the Orchestrator reports it; "
-                     "values above 4.5 are above what most voice codecs can reach.".format(mos_only, " is" if mos_only == 1 else "s are", "it" if mos_only == 1 else "them"))
+    flags = [(r.pop("_mos_only", False), r["status"]) for r in rows]
+    for r in broken:
+        r.pop("_mos_only", None)
+    mos_red, mos_amber = sum(1 for f, st in flags if f and st == "red"), sum(1 for f, st in flags if f and st == "amber")
+    plural = lambda n: "{:,} tunnel{}".format(n, "" if n == 1 else "s")
+    if mos_red or mos_amber:
+        notes.append("On MOS alone, with loss, latency and jitter within their thresholds: {} outside the thresholds and {} between them. Check the MOS thresholds "
+                     "(GET /health/healthThresholdConfig) before treating these as path problems.".format(plural(mos_red), plural(mos_amber).replace(" tunnels", "").replace(" tunnel", "")))
+    high = sum(1 for r in rows if (r.get("mos") or 0) > 4.5)
+    if high:
+        notes.append("{} shows MOS above 4.5, the top of what most voice codecs can reach; it is shown as the Orchestrator reports it.".format(plural(high)) if high == 1 else
+                     "{} show MOS above 4.5, the top of what most voice codecs can reach; they are shown as the Orchestrator reports them.".format(plural(high)))
+    if any(r.get("tunnel_now") for r in rows):
+        notes.append("Tunnel now: down when the tunnel is down at collection time; such a tunnel is never Good, whatever its grade over the period (why: down now).")
     if ctx.get("mos_setting"):
         notes.append("MOS is left out of these grades, as it is out of the health headline on this page: its threshold setting rates nearly every hour unhealthy.")
-    for column in ("note", "why"):  # these columns only when a row has one
+    for column in ("note", "why", "tunnel_now"):  # these columns only when a row has one
         if not any(r.get(column) for r in rows):
             for r in rows:
                 r.pop(column, None)
@@ -1217,18 +1230,6 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return sections
 
 
-def _path_counts(rows: List[Mapping[str, Any]], metrics: Dict[str, Dict[str, Any]]) -> None:
-    """Re-derive the path counts from the rows after a row's status changed, so the tiles and the table cannot disagree."""
-    red, amber = sum(r["status"] == "red" for r in rows), sum(r["status"] == "amber" for r in rows)
-    ok, graded = sum(r["status"] == "green" for r in rows), sum(r["status"] != "grey" for r in rows)
-    for mid, value, status in (("paths_red", red, "red" if red else "green"), ("paths_amber", amber, "amber" if amber else "green")):
-        if mid in metrics:
-            metrics[mid].update(value=value, status=status)
-    if "paths_ok_pct" in metrics:
-        pct = _pct(ok, graded)
-        metrics["paths_ok_pct"].update(value=pct, status="grey" if not graded else band(pct, (90.0, 98.0)))
-
-
 def _columns(value: Any) -> List[Dict[str, Any]]:
     """{"column_def": [...], "data": [[...], ...]} (timeseries answers) as dicts."""
     if not isinstance(value, dict) or not isinstance(value.get("column_def"), list):
@@ -1256,7 +1257,7 @@ def _bucket_label(seconds: float, span_s: int) -> str:
 
 def _watch_list(ctx: Dict[str, Any], sections: Mapping[str, Any]) -> Dict[str, Any]:
     """Degraded but not failed: paths between the thresholds, appliances out of sync or syncing, alarms at warning or minor."""
-    rows = [{"what": "path between thresholds", "item": "{} {}".format(r["appliance"], r["tunnel"]),
+    rows = [{"what": "tunnel down now" if r.get("why") == "down now" else "path between thresholds", "item": "{} {}".format(r["appliance"], r["tunnel"]),
              "detail": "loss {}, latency {}".format("no data" if r.get("loss_pct") is None else "{:g} %".format(r["loss_pct"]),
                                                      "no data" if r.get("latency_ms") is None else "{:.0f} ms".format(r["latency_ms"]))} for r in (sections.get("paths-ranked") or {}).get("table", []) if r.get("status") == "amber"]
     rows += [{"what": "appliance " + r["state"], "item": r["appliance"], "detail": ""} for r in (sections.get("noc-appliances") or {}).get("table", [])
@@ -1768,6 +1769,7 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         tunnel_status.append("grey" if not total else "green" if not down else "red" if share > 10 else "amber")
         tunnel_ids += [metric("tunnels_{}_down".format(kind), down, "tunnels", "{} tunnels down".format(kind.title()), tunnel_status[-1]),
                        metric("tunnels_{}_total".format(kind), total, "tunnels", "{} tunnels".format(kind.title()))]
+    ctx["down_now"] = {(r["appliance"], r["tunnel"]) for r in tunnel_rows}  # read by _paths, which runs after this on pages with both
     down_names = sorted((str(names[ne]) for ne, st in state_of.items() if st == "unreachable"), key=len, reverse=True)
     for r in tunnel_rows:  # aliases read to_<peer hostname>_<label>: a peer that is unreachable explains the tunnel being down
         r["unreachable_end"] = "this appliance" if r["appliance"] in down_names else "far end" if any(
@@ -2000,6 +2002,11 @@ def _worst_p95(rows: List[Mapping[str, Any]]) -> Optional[float]:
                 if r["status"] != "grey" and not r.get("check") and (r["p95_out_pct"] is not None or r["p95_in_pct"] is not None)], default=None)
 
 
+def _with_p95(rows: List[Mapping[str, Any]]) -> int:
+    """Links that have a P95 in either direction, whatever their status (a link left out for its bandwidth still has one)."""
+    return sum(1 for r in rows if r.get("p95_out_pct") is not None or r.get("p95_in_pct") is not None)
+
+
 def _unmeasured(rows: List[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
     """Links with no utilisation samples at all. A link left out for an implausible bandwidth has samples, so it is not one of them."""
     return [r for r in rows if r["status"] == "grey" and not r.get("check") and r.get("p95_out_pct") is None and r.get("p95_in_pct") is None]
@@ -2101,7 +2108,7 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                            "notes": ["QoS drops are packets the shaper dropped because the class was over its share; most first. QoS drop %: of the packets the class sent. "
                                      "Other drops are packets dropped for any other reason.", "Rule: any QoS drops is a warning; a drop % near 0 means the class only briefly went over its share."]}
     sections["cap-summary"] = {"status": status, "metrics": [m_flag, metric("worst_p95_pct", worst_p95, "%", "Highest WAN P95 utilisation", _load_status(worst_p95, limits)),
-                                                             metric("links_measured", len(measured), "links", "WAN links with a P95"),
+                                                             metric("links_measured", _with_p95(rows), "links", "WAN links with a P95"),
                                                              metric("wan_links", len(links), "links", "WAN links found")]}
     return sections
 
