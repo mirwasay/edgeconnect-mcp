@@ -872,6 +872,41 @@ class LayoutTests(unittest.TestCase):
         self.assertIn("branch-a \u00b7 loss: 100% (Good)", page)
 
 
+class CardTests(unittest.TestCase):
+    """Possible causes and actions come only from cards.json, and only when their conditions hold on the metrics."""
+
+    def test_clauses(self):
+        metrics = {"a": {"value": 3, "status": "red"}, "b": {"value": 5, "status": None}, "n": {"value": None, "status": "grey"}}
+        holds = lambda clause: report.clause_holds(clause, metrics)
+        self.assertEqual([holds(["a", "<", 5]), holds(["a", "<", "b"]), holds(["a", ">=", 4]), holds(["a", "status", ["red"]]), holds(["n", ">", 0]), holds(["n", "==", None]),
+                          holds(["missing", ">", 0])], [True, True, False, True, False, True, False])
+
+    def test_mos_threshold_cause_and_action_appear_only_when_the_data_says_so(self):
+        hours = HealthByCategoryTests.hours
+        bad_mos = {"health:" + cat: {"1.NE": hours("MAJOR" if cat == "MOS" else "HEALTHY")} for cat in ("LOSS", "LATENCY", "JITTER", "MOS")}
+        sec = report.compute(phase2_bundle("noc", **bad_mos))["sections"]["noc-health"]
+        self.assertEqual(([c["id"] for c in sec["causes"]], [a["id"] for a in sec["actions"]]), (["mos_threshold"], ["review_health_thresholds"]))
+        bad_loss = {"health:" + cat: {"1.NE": hours("MAJOR" if cat in ("MOS", "LOSS") else "HEALTHY")} for cat in ("LOSS", "LATENCY", "JITTER", "MOS")}
+        sec = report.compute(phase2_bundle("noc", **bad_loss))["sections"]["noc-health"]
+        self.assertEqual([c["id"] for c in sec["causes"]], ["path_loss"])  # loss is bad too: no longer just a MOS setting
+        page = report.render(report.compute(phase2_bundle("noc", **bad_mos)))
+        self.assertIn("<h3>Possible causes</h3>", page)
+        self.assertIn("<h3>Recommended actions</h3>", page)
+
+    def test_every_card_is_well_formed_and_names_real_sections(self):
+        known = {sid for sections in report.SECTIONS.values() for sid, _ in sections}
+        for sid, card in report.CARDS.items():
+            self.assertIn(sid, known)
+            for entry in card["causes"] + card["actions"]:
+                self.assertTrue(entry["id"] and entry["text"] and isinstance(entry["when"], list) and entry["when"])
+                for clause in entry["when"]:
+                    self.assertIn(clause[1], ("<", "<=", ">", ">=", "==", "!=", "status"))
+
+    def test_executive_sections_carry_the_actions_of_their_sources(self):
+        m = report.compute(phase2_bundle("executive", active_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}]))
+        self.assertIn("triage_critical", [a["id"] for a in m["sections"]["exec-alarms"]["actions"]])
+
+
 class HealthByCategoryTests(unittest.TestCase):
     """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
 

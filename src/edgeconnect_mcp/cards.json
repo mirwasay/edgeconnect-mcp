@@ -1,0 +1,109 @@
+{
+ "about": "Guidance cards: per report section, the possible causes and actions a report may show. Code shows an entry only when every clause of its `when` holds on the computed metrics; nothing else is ever shown, so every model gives the same list. A clause is [metric, op, value] with op one of < <= > >= == !=, or [metric, \"status\", [statuses]]. Causes are possibilities, never conclusions.",
+ "sections": {
+  "avail-appliances": {
+   "causes": [
+    {"id": "appliance_outage", "text": "Appliances lost contact with the Orchestrator for part of the period: a site power, ISP or management-path outage, or a reboot.", "when": [["appliances_below_target", ">", 0]]},
+    {"id": "old_ecos_no_samples", "text": "Appliances on ECOS older than 9.3.4 / 9.4.2 / 9.5.0 report no reachability samples, which reads as missing data rather than downtime.", "when": [["appliances_measured", "<", "appliances_total"]]}
+   ],
+   "actions": [
+    {"id": "check_reachability_history", "text": "Open Monitoring > Availability for the appliances below target and match the down minutes with the alarm history for the same days.", "when": [["appliances_below_target", ">", 0]]}
+   ]
+  },
+  "avail-tunnels": {
+   "causes": [
+    {"id": "underlay_circuit", "text": "An underlay (transport) circuit was down or unstable, taking the tunnels on it down.", "when": [["underlay_avail_pct", "status", ["amber", "red"]]]},
+    {"id": "overlay_brownout", "text": "Tunnels stayed up but degraded (brownout): loss or latency above the overlay's SLA without a full outage.", "when": [["overlay_degraded_pct", ">", 0.5]]},
+    {"id": "unused_paths", "text": "Tunnels down for the whole period are usually unused or decommissioned paths, not outages.", "when": [["tunnel_groups_down_all_period", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "review_down_all_period", "text": "Review the tunnels listed as down all period; remove or disable the ones that are no longer meant to exist so they stop counting.", "when": [["tunnel_groups_down_all_period", ">", 0]]},
+    {"id": "open_carrier_ticket", "text": "For transports below target, compare their down minutes across sites: the same circuit label failing at several sites points to the carrier.", "when": [["underlay_avail_pct", "status", ["amber", "red"]]]}
+   ]
+  },
+  "avail-paths": {
+   "causes": [
+    {"id": "path_impairment", "text": "Paths outside the health thresholds: loss, latency or jitter on the underlying circuit, or congestion at one end.", "when": [["paths_red", ">", 0]]},
+    {"id": "idle_probe_loss", "text": "Tunnels that carry no traffic yet lose probes are usually broken or misconfigured paths (firewall, NAT or a dead peer).", "when": [["paths_idle_probe_loss", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "check_worst_paths", "text": "Start with the worst paths in the table: compare pre-FEC and post-FEC loss and the transport each runs on (Monitoring > Tunnel Health).", "when": [["paths_red", ">", 0]]},
+    {"id": "fix_or_remove_idle", "text": "Check the idle tunnels that lose probes in the tunnel list; fix the peer or remove the unused path.", "when": [["paths_idle_probe_loss", ">", 0]]}
+   ]
+  },
+  "avail-alarms": {
+   "causes": [],
+   "actions": [
+    {"id": "store_alarms_daily", "text": "Run `edgeconnect-mcp report store` daily so alarms older than the Orchestrator's 7 days are kept for monthly reports.", "when": [["alarms_critical", "==", null]]}
+   ]
+  },
+  "noc-appliances": {
+   "causes": [
+    {"id": "unreachable_site", "text": "Unreachable appliances: site power, ISP, or the management path to the Orchestrator is down.", "when": [["state_unreachable", ">", 0]]},
+    {"id": "config_drift", "text": "Out-of-sync appliances have configuration that differs from what the Orchestrator expects.", "when": [["state_out_of_sync", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "contact_site", "text": "For each unreachable appliance, check whether it is planned (maintenance, decommissioned) before contacting the site.", "when": [["state_unreachable", ">", 0]]},
+    {"id": "resync", "text": "Review out-of-sync appliances in the Orchestrator and resynchronise them after checking what differs.", "when": [["state_out_of_sync", ">", 0]]}
+   ]
+  },
+  "noc-alarms": {
+   "causes": [],
+   "actions": [
+    {"id": "triage_critical", "text": "Triage the critical alarms first (oldest at the top of the table), then the major ones.", "when": [["active_critical", ">", 0]]},
+    {"id": "triage_major", "text": "Work through the major alarms grouped by appliance; one appliance with many alarms is usually one problem.", "when": [["active_major", ">", 0]]}
+   ]
+  },
+  "noc-health": {
+   "causes": [
+    {"id": "mos_threshold", "text": "MOS is rated unhealthy almost everywhere while loss, latency and jitter are healthy: the MOS health threshold setting is the likely cause, not the network.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 95], ["health_latency_good_24h_pct", ">=", 95], ["health_jitter_good_24h_pct", ">=", 95]]},
+    {"id": "standing_alarms", "text": "Standing alarms rate every hour as unhealthy until they are cleared, even when traffic is fine.", "when": [["health_alarm_good_24h_pct", "<", 50]]},
+    {"id": "path_loss", "text": "Loss outside the threshold on some paths in the last 24 hours.", "when": [["health_loss_good_24h_pct", "<", 95]]}
+   ],
+   "actions": [
+    {"id": "review_health_thresholds", "text": "Check the MOS thresholds in the Orchestrator's health settings (GET /health/healthThresholdConfig) against the measured MOS before treating this as an outage.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 95]]},
+    {"id": "clear_stale_alarms", "text": "Clear or acknowledge alarms that are no longer relevant so health reflects current conditions.", "when": [["health_alarm_good_24h_pct", "<", 50]]}
+   ]
+  },
+  "noc-tunnels": {
+   "causes": [
+    {"id": "tunnels_down", "text": "Tunnels down now: a failed transport at one end, or tunnels to appliances that are themselves unreachable.", "when": [["tunnels_bonded_down", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "match_with_unreachable", "text": "Match the tunnels down with the unreachable appliances first; the rest point to transport problems.", "when": [["tunnels_bonded_down", ">", 0]]}
+   ]
+  },
+  "cap-links": {
+   "causes": [
+    {"id": "sustained_load", "text": "Links at or above the planning limit for a large share of hours: sustained demand, or a scheduled job such as backups running in business hours.", "when": [["links_flagged", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "attribute_before_upgrade", "text": "Before ordering bandwidth, check which applications drive the busy links; QoS or rescheduling may solve it.", "when": [["links_flagged", ">", 0]]}
+   ]
+  },
+  "life-licences": {
+   "causes": [],
+   "actions": [
+    {"id": "renew_licences", "text": "Start renewal for licences expiring within 90 days.", "when": [["licences_expiring_90", ">", 0]]}
+   ]
+  },
+  "life-backups": {
+   "causes": [],
+   "actions": [
+    {"id": "fix_backups", "text": "Check the scheduled backup job for appliances without a backup in 30 days.", "when": [["backups_stale", ">", 0]]}
+   ]
+  },
+  "life-advisories": {
+   "causes": [],
+   "actions": [
+    {"id": "plan_upgrade", "text": "Plan upgrades for the versions listed against advisories; read each advisory for workarounds until then.", "when": [["advisory_hits", ">", 0]]}
+   ]
+  },
+  "life-inventory": {
+   "causes": [],
+   "actions": [
+    {"id": "converge_trains", "text": "More than one ECOS train is in use: plan to bring appliances onto one supported train.", "when": [["ecos_trains", ">", 1]]}
+   ]
+  }
+ }
+}

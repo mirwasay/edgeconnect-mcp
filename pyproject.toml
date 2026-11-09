@@ -9,7 +9,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-edgeconnect_mcp = ["op_notes.json"]
+edgeconnect_mcp = ["op_notes.json", "cards.json"]
 
 [project]
 name = "edgeconnect-mcp"

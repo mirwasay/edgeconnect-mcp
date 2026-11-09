@@ -149,8 +149,8 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
 
 
 def section(sid: str, number: int, title: str, status: str, summary: str, figure: str, stat_html: str, rows: Sequence[Mapping[str, Any]],
-            notes: Sequence[str], appendix: List[str]) -> str:
-    """One section, always the same anatomy: number, title, status; summary; figures; table view; notes."""
+            notes: Sequence[str], appendix: List[str], causes: Sequence[str] = (), actions: Sequence[str] = ()) -> str:
+    """One section, always the same anatomy: number, title, status; summary; figures; table view; notes; possible causes; actions."""
     view = ""
     if rows:
         if len(rows) > APPENDIX_ROWS:
@@ -159,7 +159,8 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
             view = '<p class="options">{:,} rows: <a href="#appendix-{}">full table in the appendix</a>.</p>'.format(len(rows), esc(sid))
         else:
             view = '<details class="tbl" open><summary>Table ({} row{})</summary>{}</details>'.format(len(rows), "" if len(rows) == 1 else "s", table(rows))
-    note_html = '<div class="notes"><h3>Notes</h3><ul>{}</ul></div>'.format("".join("<li>{}</li>".format(esc(n)) for n in notes)) if notes else ""
+    lists = (("Notes", notes), ("Possible causes", causes), ("Recommended actions", actions))
+    note_html = "".join('<div class="notes"><h3>{}</h3><ul>{}</ul></div>'.format(h, "".join("<li>{}</li>".format(esc(i)) for i in items)) for h, items in lists if items)
     return ('<section id="{0}" data-section-id="{0}" aria-labelledby="{0}-h"><header class="sec-head"><span class="num">{1}</span><h2 id="{0}-h">{2}</h2>{3}</header>'
             '{4}{5}{6}{7}{8}</section>').format(esc(sid), number, esc(title), pill(status), summary, stat_html, figure, view, note_html)
 

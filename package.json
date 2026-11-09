@@ -4,7 +4,7 @@
   "description": "Secure MCP server for the HPE Aruba EdgeConnect Orchestrator REST API, with a report command (runs the bundled Python server)",
   "license": "Apache-2.0",
   "bin": { "edgeconnect-mcp": "bin/edgeconnect-mcp.js" },
-  "files": ["bin/", "src/edgeconnect_mcp/*.py", "src/edgeconnect_mcp/op_notes.json"],
+  "files": ["bin/", "src/edgeconnect_mcp/*.py", "src/edgeconnect_mcp/op_notes.json", "src/edgeconnect_mcp/cards.json"],
   "engines": { "node": ">=18" },
   "repository": { "type": "git", "url": "git+https://github.com/mirwasay/edgeconnect-mcp.git" }
 }

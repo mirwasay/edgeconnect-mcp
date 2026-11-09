@@ -83,6 +83,12 @@ _STATUS_WORDS = {"green": ("healthy", "on target", "meets target", "met target",
                  "red": ("failing", "below target", "missed target", "outage"),  # not critical / warning: those name alarm severities
                  "grey": ("no data", "not available", "unknown")}
 MAX_TEXT = 1200
+CARDS: Dict[str, Any] = json.loads((Path(__file__).with_name("cards.json")).read_text(encoding="utf-8"))["sections"]
+# Executive blocks show the actions of the sections they summarise.
+EXEC_SOURCES = {"exec-availability": ("avail-appliances", "avail-tunnels", "avail-paths"), "exec-alarms": ("noc-alarms",), "exec-licensing": ("life-licences",),
+                "exec-software": ("life-inventory",), "exec-capacity": ("cap-links",), "exec-noc": ("noc-appliances", "noc-health", "noc-tunnels"),
+                "exec-lifecycle": ("life-backups", "life-advisories")}
+_OPS = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
 # Figures written as words are figures too.
 _NUMBER_WORDS = re.compile(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
                            r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundreds?|thousands?|millions?|dozens?|half|halves|twice|doubled?|tripled?|"
@@ -590,6 +596,9 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     kept = day_retention(data.get("retention"), ("tunnel", "interface"))
     if kept and bundle["period"]["from_ms"] // 1000 < now_s - kept and report in ("availability", "capacity", "executive"):
         gaps.append("The period starts older than the {:g} days of daily statistics this Orchestrator keeps, so path quality and capacity cover only part of it, or none.".format(kept / 86400))
+    for sid, sec in sections.items():  # possible causes and actions: only card entries whose conditions hold
+        sources = EXEC_SOURCES.get(sid, (sid,))
+        sec["causes"], sec["actions"] = _eligible(sources, metrics, "causes"), _eligible(sources, metrics, "actions")
     sections["data-gaps"] = {"status": "grey" if gaps else "green", "metrics": [], "notes": gaps or ["None: every call returned data."]}
     headline = None
     if report == "executive":
@@ -609,6 +618,32 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
             "options": dict(options, down_tunnels_count=metrics.get("tunnel_groups_down_all_period", {}).get("value"),
                             idle_paths_count=metrics.get("paths_idle_probe_loss", {}).get("value")),
             "headline": headline, "metrics": metrics, "sections": {sid: sections[sid] for sid, _ in SECTIONS[report]}}
+
+
+def clause_holds(clause: List[Any], metrics: Mapping[str, Mapping[str, Any]]) -> bool:
+    """[metric, op, value]: value may name another metric; a metric with no value only matches == None."""
+    mid, op, want = clause
+    if mid not in metrics:
+        return False
+    if op == "status":
+        return metrics[mid].get("status") in want
+    have = metrics[mid].get("value")
+    if isinstance(want, str) and want in metrics:
+        want = metrics[want].get("value")
+    if op in ("==", "!="):
+        return (have == want) == (op == "==")
+    if not isinstance(have, (int, float)) or not isinstance(want, (int, float)):
+        return False
+    return _OPS[op](have, want)
+
+
+def _eligible(sids: Tuple[str, ...], metrics: Mapping[str, Any], kind: str) -> List[Dict[str, str]]:
+    seen: Dict[str, Dict[str, str]] = {}
+    for sid in sids:
+        for entry in (CARDS.get(sid) or {}).get(kind, []):
+            if all(clause_holds(c, metrics) for c in entry["when"]):
+                seen.setdefault(entry["id"], {"id": entry["id"], "text": entry["text"]})
+    return list(seen.values())
 
 
 def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -1279,7 +1314,7 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
         text = _TOKEN.sub(lambda m: html.escape(_fmt(metrics["metrics"][m.group(1)], unit_word=False)), text)
         parts.append(layout.section(sid, number, titles[sid], sec["status"], '<p class="summary">{}</p>'.format(text) if text else "", _figure(sid, sec),
                                     layout.stats([shown(mid) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]), sec.get("table") or [],
-                                    sec.get("notes", []), appendix))
+                                    sec.get("notes", []), appendix, [c["text"] for c in sec.get("causes", [])], [a["text"] for a in sec.get("actions", [])]))
         index.append((sid, "{} {}".format(number, titles[sid]), sec["status"]))
     areas = [sid for sid in order if sid != "data-gaps"]
     head = metrics.get("headline")
