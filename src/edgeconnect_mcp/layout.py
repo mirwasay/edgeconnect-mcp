@@ -179,8 +179,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
         coords = " ".join("{:.1f},{:.1f}".format(sx(at[label]), sy(v)) for label, v in pts)
         parts.append('<polyline fill="none" stroke="{}" stroke-width="2" points="{}"><title>{}</title></polyline>'.format(SERIES[k], coords, esc(name)))
         # a marker per point, so a series with one point (or isolated ones) still shows; hover gives the value
-        parts += ['<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}"><title>{} {}: {:g}{}</title></circle>'.format(sx(at[label]), sy(v), SERIES[k], esc(name), esc(label), round(v, 3), esc(unit))
-                  for label, v in pts]
+        parts += ['<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}"><title>{} {}: {}</title></circle>'.format(
+            sx(at[label]), sy(v), SERIES[k], esc(name), esc(label), human_bytes(v) if unit == "bytes" else "{:g}{}".format(round(v, 3), esc(unit))) for label, v in pts]
     legend = "".join('<span><i style="background:{}"></i>{}</span>'.format(SERIES[k], esc(name)) for k, (name, _) in enumerate(series))
     return ('<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg><figcaption class="legend">{}</figcaption></figure>').format(
         width, height + 10, esc(title), esc(title), "".join(parts), legend)
@@ -244,11 +244,12 @@ def cell(value: Any) -> Tuple[str, bool]:
     return str(value), False
 
 
-def table(rows: Sequence[Mapping[str, Any]]) -> str:
+def table(rows: Sequence[Mapping[str, Any]], full: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
     """Every row, every column, in the order given; numbers right-aligned; a `status` column shown as a pill."""
     if not rows:
         return ""
-    columns = [c for c in rows[0].keys() if any(r.get(c) not in ("", None) for r in rows) or any(r.get(c) is None for r in rows)]  # a column blank on every row says nothing
+    every = full or rows  # columns are chosen on the whole table, so the rows shown in place and the appendix have the same columns
+    columns = [c for c in rows[0].keys() if any(r.get(c) not in ("", None) for r in every) or any(r.get(c) is None for r in every)]  # blank on every row: says nothing
     plain = lambda v: v.get("value") if isinstance(v, dict) else v  # a cell may be {"value": .., "status": ..}, shown with its status icon
     numeric = {c for c in columns if all(isinstance(plain(r.get(c)), (int, float)) and not isinstance(plain(r.get(c)), bool) for r in rows if plain(r.get(c)) is not None)
                and any(plain(r.get(c)) is not None for r in rows)}
@@ -282,7 +283,7 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
             appendix.append('<section class="appendix" id="appendix-{0}" data-section-id="appendix-{0}"><h2>Appendix: {1}</h2><p>All {2:,} rows.</p>{3}</section>'.format(
                 esc(sid), esc(title), len(rows), table(rows)))
             view = '<details class="tbl" open><summary>Table</summary>{}</details><p class="options">{} {} of {:,} shown; <a href="#appendix-{}">all {:,} rows in the appendix</a>.</p>'.format(
-                table(rows[:SHOWN_ROWS]), "Worst" if "status" in rows[0] or any(isinstance(v, dict) for v in rows[0].values()) else "Top", SHOWN_ROWS, len(rows), esc(sid), len(rows))
+                table(rows[:SHOWN_ROWS], rows), "Worst" if "status" in rows[0] or any(isinstance(v, dict) for v in rows[0].values()) else "Top", SHOWN_ROWS, len(rows), esc(sid), len(rows))
         else:
             view = '<details class="tbl" open><summary>Table ({} row{})</summary>{}</details>'.format(len(rows), "" if len(rows) == 1 else "s", table(rows))
     if apart and apart.get("rows"):  # things set aside (idle tunnels, unused ports): a table at the end, never a paragraph of names

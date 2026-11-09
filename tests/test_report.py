@@ -1792,5 +1792,87 @@ class PolishTests(unittest.TestCase):
         self.assertIn("Informational", " ".join(m["sections"]["traffic-countries"]["notes"]))
 
 
+class Round4DefectTests(unittest.TestCase):
+    """Defects the fourth set of fresh readers found on the pages (2026-11-09)."""
+
+    path = PersonaReviewTests.path
+
+    def test_1_suspect_bandwidth_links_are_no_data_everywhere(self):
+        link = {"nePk": "1.NE", "interface": "wan0", "label": "", "bw_tx": 300, "bw_rx": 300, "avg_tx_pct": 1, "avg_rx_pct": 1, "source": "x"}
+        rows = [{"appliance": "a", "p95_out_pct": 27.0, "p95_in_pct": 1.0, "check": report._bandwidth_note(link), "status": "green"}]
+        self.assertEqual(report._link_status(rows[0]), "grey")  # a % of a 0.3 Mbps rate is not a measurement
+
+    def test_2_a_column_kept_for_the_appendix_is_kept_in_place(self):
+        rows = [{"appliance": "a{}".format(i), "now": ""} for i in range(20)] + [{"appliance": "z", "now": "down"}]
+        self.assertIn(">Now<", layout.table(rows[:15], rows))
+
+    def test_3_bulk_change_failures_are_not_counted_twice(self):
+        audit = [{"user": "OverlayManager", "name": "Apply Appliance Template", "nepk": "1.NE", "queuedTime": 1, "completionStatus": False},
+                 {"user": "OverlayManager", "name": "Apply Appliance Templates", "nepk": "1.NE", "queuedTime": 2, "completionStatus": False}]
+        m = report.compute(phase2_bundle("activity", activity_audit=audit))
+        self.assertEqual(m["metrics"]["act_changes_failed"]["value"], 1)
+
+    def test_4_incident_open_counts_reconcile_on_the_page(self):
+        alarms = [{"id": 1, "applianceId": "1.NE", "severity": "MAJOR", "timeOccurredInMills": T0 - 1000},
+                  {"id": 2, "applianceId": "1.NE", "severity": "MAJOR", "timeOccurredInMills": T0 + 1000, "clearedTimeInMills": T0 + 2000}]
+        b = bundle(incident={"from_ms": T0, "to_ms": T0 + 3600000, "affected": []}, incident_alarms_stored=True, incident_alarms=alarms)
+        b["report"] = "incident"
+        m = report.compute(b)
+        self.assertEqual(m["metrics"]["inc_cleared_in_window"]["value"], 1)
+        self.assertIn("1 already open + 1 raised - 1 cleared = 1 open at the end", " ".join(m["sections"]["inc-timeline"]["notes"]))
+        notes = " ".join(m["sections"]["inc-changes"]["notes"])
+        self.assertNotIn("a cut audit log with none failed is No data", notes)
+
+    def test_5_combined_health_leaves_out_hours_a_category_did_not_rate(self):
+        h = HealthByCategoryTests.hours
+        alarm = h("MAJOR", 12) + [{"status": None, "blank": True, "time": NOW - 3600 * (k + 13)} for k in range(12)]
+        data = {"health:ALARM": {"1.NE": alarm}, "health:LOSS": {"1.NE": h("HEALTHY")}}
+        m = report.compute(phase2_bundle("noc", **data))
+        self.assertEqual(m["metrics"]["health_good_24h_pct"]["value"], 0.0)  # the 12 hours without an alarm rating are not "healthy"
+
+    def test_6_unrated_appliances_have_no_unhealthy_hour_count(self):
+        data = {"health:LOSS": {"1.NE": HealthByCategoryTests.hours("HEALTHY")}}
+        m = report.compute(phase2_bundle("noc", appliances=[dict(APPLIANCES[0]), dict(APPLIANCES[1])], **data))
+        row = next(r for r in m["sections"]["noc-worst"]["table"] if r["appliance"] == "branch-b<script>")
+        self.assertIsNone(row["unhealthy_hours_24h"])
+
+    def test_6b_tunnel_state_and_path_counts_are_reconciled(self):
+        paths = {"a": {"1.NE": self.path("to_hub_DEFAULT", 50000, 0)}}
+        b = phase2_bundle("health", health_threshold=THRESHOLDS, tunnels_bonded={"1.NE": {"x": {"alias": "to_hub_DEFAULT", "operStatus": "up"}, "y": {"alias": "to_b_DEFAULT", "operStatus": "up"}}},
+                          **{"paths:1.NE": paths})
+        notes = " ".join(report.compute(b)["sections"]["paths-ranked"]["notes"])
+        self.assertIn("The tunnel state lists 2 tunnels; 1 has path statistics for the period", notes)
+
+    def test_7_optimisation_coverage_is_one_breakdown(self):
+        flow = {"OPTIMIZED_TRAFFIC": {"X": {"1.NE": {"nePk": "1.NE", "SUM_LRX_BYTES": 0, "SUM_LTX_BYTES": 0, "SUM_WTX_BYTES": 0, "SUM_WRX_BYTES": 0}}}}
+        m = report.compute(phase2_bundle("optimisation", **{"flows:1.NE": flow}))
+        self.assertIn("2 in scope = 0 with optimised traffic + 1 with flow records but no optimised bytes + 1 with no flow records",
+                      " ".join(m["sections"]["opt-appliances"]["notes"]))
+
+    def test_8_unlabelled_transports_are_counted_and_uncounted_alarms_say_why(self):
+        data = {"underlay:1.NE": {"0": [{"count": 100, "tunnel_state": 600, "brownout": 0, "label": "", "overlayid": 0}]}}
+        m = report.compute(bundle(**data))
+        names = [r["name"] for r in m["sections"]["avail-transport"]["table"]]
+        self.assertIn("no label", names)
+        m2 = report.compute(bundle(appliance_alarms=[], period_alarms_covered=False))
+        self.assertIn("not counted", m2["metrics"]["alarms_critical"]["label"])
+
+    def test_9_no_data_paths_show_no_latency_or_mos(self):
+        paths = {"a": {"1.NE": self.path("to_a", 0, 0)}}
+        row = report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))["sections"]["paths-ranked"]["table"][0]
+        self.assertEqual((row["latency_ms"], row["jitter_ms"], row["mos"]), (None, None, None))
+
+    def test_10_hourly_traffic_has_one_point_per_hour_of_the_period_and_readable_tooltips(self):
+        start = NOW - 86400
+        trend = {"column_def": ["TIMESTAMP", "WTX_BYTES", "WRX_BYTES"], "data": [[start + 3600 * h, 1, 0] for h in range(25)]}
+        b = phase2_bundle("traffic", **{"trend:1.NE": trend, "apps:1.NE": [{"APPNAME": "__total__", "SUM_WTX_BYTES": 1, "SUM_WRX_BYTES": 0}]})
+        b["period"].update(from_ms=start * 1000, to_ms=NOW * 1000)
+        m = report.compute(b)
+        self.assertEqual(len(m["sections"]["traffic-summary"]["chart"]["series"][0][1]), 24)
+        svg = layout.line("t", [["s", [["a", 2.5e9]]]], "bytes")
+        self.assertIn("2.50 GB", svg)
+        self.assertNotIn("e+09", svg)
+
+
 if __name__ == "__main__":
     unittest.main()
