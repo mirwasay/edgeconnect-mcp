@@ -907,6 +907,60 @@ class CardTests(unittest.TestCase):
         self.assertIn("triage_critical", [a["id"] for a in m["sections"]["exec-alarms"]["actions"]])
 
 
+DNS_HEADER = ["LANTX_PKTS", "MIN_TIME", "IS_SOURCE", "DNS", "LANRX_PKTS", "FLOW_COUNT", "IPADDR", "CALC_DNS", "FLOWS_DELETED", "WANRX_BYTES", "WANTX_BYTES", "MAX_TIME",
+              "SPLIT_TYPE", "COUNTRY", "WANRX_PKTS", "WANTX_PKTS", "NEPK", "SERVICE_ID", "COUNT", "LANRX_BYTES", "LANTX_BYTES", "FLOWS_CREATED"]
+PORT_HEADER = ["LANTX_PKTS", "PORT", "MIN_TIME", "IS_SOURCE", "PROTOCOL", "LANRX_PKTS", "FLOW_COUNT", "FLOWS_DELETED", "IS_KNOWN", "WANRX_BYTES", "WANTX_BYTES", "MAX_TIME",
+               "WANRX_PKTS", "WANTX_PKTS", "NEPK", "COUNT", "LANRX_BYTES", "LANTX_BYTES", "FLOWS_CREATED"]
+
+
+def dns_row(ne, name, country, wan_tx, wan_rx):
+    row = dict.fromkeys(DNS_HEADER, 0)
+    row.update(NEPK=ne, DNS=name, CALC_DNS="", IPADDR="10.0.0.1", COUNTRY=country, WANTX_BYTES=wan_tx, WANRX_BYTES=wan_rx)
+    return [row[h] for h in DNS_HEADER]
+
+
+def port_row(ne, port, proto, wan_tx, wan_rx):
+    row = dict.fromkeys(PORT_HEADER, 0)
+    row.update(NEPK=ne, PORT=port, PROTOCOL=proto, WANTX_BYTES=wan_tx, WANRX_BYTES=wan_rx)
+    return [row[h] for h in PORT_HEADER]
+
+
+class TrafficTests(unittest.TestCase):
+    """R4 Traffic and applications: what uses the WAN, summed over every appliance in scope."""
+
+    def data(self):
+        app = lambda ne, name, tx, rx: {"nePk": ne, "APPNAME": name, "SUM_WTX_BYTES": tx, "SUM_WRX_BYTES": rx}
+        return {"apps:1.NE": [app("1.NE", "__total__", 900, 100), app("1.NE", "Zoom", 500, 100), app("1.NE", "Office365", 300, 0)],
+                "apps:2.NE": [app("2.NE", "__total__", 1000, 0), app("2.NE", "Office365", 700, 0)],
+                "apps_previous:1.NE": [app("1.NE", "__total__", 400, 100)], "apps_previous:2.NE": [app("2.NE", "__total__", 500, 0)],
+                "talkers:1.NE": [{"1.NE": [{"SOURCE_IP": "10.1.1.1", "WANTX_BYTES": 70, "WANRX_BYTES": 30}]}],
+                "dns:1.NE": [{"1.NE": [dns_row("1.NE", "example.com", "Germany", 60, 40), dns_row("1.NE", "", "Germany", 10, 0)]}, {"header": [DNS_HEADER]}],
+                "ports:1.NE": [{"1.NE": [port_row("1.NE", 443, 6, 80, 20)]}, {"header": [PORT_HEADER]}]}
+
+    def test_applications_are_summed_over_appliances_with_share_and_change(self):
+        m = report.compute(phase2_bundle("traffic", **self.data()))
+        apps = m["sections"]["traffic-apps"]["table"]
+        self.assertEqual([(r["application"], r["wan_bytes"], r["share_pct"]) for r in apps], [("Office365", 1000, 50.0), ("Zoom", 600, 30.0)])
+        self.assertEqual((m["metrics"]["wan_bytes_total"]["value"], m["metrics"]["wan_bytes_change_pct"]["value"]), (2000, 100.0))  # previous period 1,000
+        self.assertEqual(m["sections"]["traffic-domains"]["table"][0]["domain"], "example.com")
+        self.assertEqual(m["sections"]["traffic-countries"]["table"][0], {"country": "Germany", "wan_bytes": 110, "share_pct": 100.0})
+        self.assertEqual(m["sections"]["traffic-ports"]["table"][0]["port"], "443/tcp")
+        self.assertEqual(m["sections"]["traffic-talkers"]["table"][0], {"appliance": "branch-a", "source_ip": "10.1.1.1", "wan_bytes": 100})
+        self.assertIn("capped at 100", " ".join(m["sections"]["traffic-talkers"]["notes"]))
+
+    def test_collect_reads_every_appliance_for_the_window_and_the_previous_one(self):
+        client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(dict(SPEC, paths=dict(SPEC["paths"], **{p: {"get": {"summary": p}} for p in report.TRAFFIC_PATHS}))))
+            orchestrator = Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)
+            b = report.collect(Server({"lab": orchestrator}, default="lab", log=lambda line: None), "lab", "traffic", now=datetime(2026, 9, 21, tzinfo=timezone.utc))
+        apps = [c[2] for c in client.calls if c[1] == "/stats/aggregate/application2"]
+        self.assertEqual([(q["nePk"], q["endTime"] - q["startTime"]) for q in apps], [("1.NE", 7 * 86400), ("2.NE", 7 * 86400), ("1.NE", 7 * 86400), ("2.NE", 7 * 86400)])
+        self.assertEqual(apps[2]["endTime"], apps[0]["startTime"])  # the previous period ends where this one starts
+        self.assertEqual(b["options"]["period"], "last-7-days")
+
+
 class HealthByCategoryTests(unittest.TestCase):
     """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
 

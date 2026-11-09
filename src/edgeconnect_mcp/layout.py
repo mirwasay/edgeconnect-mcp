@@ -115,6 +115,14 @@ def grid(title: str, rows: Sequence[Tuple[str, Sequence[Tuple[str, Optional[str]
         x0 + len(columns) * cw + 4, 26 + len(rows) * rh, esc(title), esc(title), "".join(parts))
 
 
+def human_bytes(n: float) -> str:
+    """Decimal units (1 GB = 10^9 bytes)."""
+    for unit, size in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if abs(n) >= size:
+            return "{:.2f} {}".format(n / size, unit)
+    return "{:.0f} bytes".format(n)
+
+
 def cell(value: Any) -> Tuple[str, bool]:
     if value is None:
         return "no data", False
@@ -142,7 +150,7 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
             if c == "status":
                 tds.append("<td>{}</td>".format(pill(r.get(c))))
                 continue
-            text, _ = cell(r.get(c))
+            text = human_bytes(r[c]) if c.endswith("bytes") and c in numeric and r.get(c) is not None else cell(r.get(c))[0]
             tds.append('<td class="{}">{}</td>'.format("n" if c in numeric else "", esc(text)))
         body.append("<tr>{}</tr>".format("".join(tds)))
     return '<div class="tablewrap"><table><thead><tr>{}</tr></thead><tbody>{}</tbody></table></div>'.format(head, "".join(body))
