@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # Report statuses (green/amber/red/grey) -> the fixed notation: class, icon, word. Status is never shown by colour alone.
 STATUS = {"green": ("good", "✓", "Good"), "amber": ("warning", "!", "Warning"), "red": ("critical", "✕", "Critical"), "grey": ("nodata", "–", "No data")}
+THEMES = ("auto", "light", "dark")  # auto follows the reader's system setting; print is always light
 APPENDIX_ROWS = 50  # longer tables move, whole, to the appendix; no row is ever dropped
 MAX_TILES = 6
 
@@ -14,6 +15,8 @@ CSS = """
 --series:#2a78d6;--good:#0ca30c;--warning:#fab219;--critical:#d03b3b;--nodata:#c3c2b7;--goodtext:#006300;--warntext:#8a5a00;--crittext:#b42318}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a9890;
 --grid:#2c2c2a;--base:#383835;--ring:rgba(255,255,255,.10);--series:#3987e5;--goodtext:#0ca30c;--warntext:#fab219;--crittext:#f07a7a}}
+:root[data-theme="dark"]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a9890;
+--grid:#2c2c2a;--base:#383835;--ring:rgba(255,255,255,.10);--series:#3987e5;--goodtext:#0ca30c;--warntext:#fab219;--crittext:#f07a7a}
 *{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{max-width:1080px;margin:0 auto;padding:24px 16px 48px}
 .rpt-head{border-bottom:2px solid var(--ink);padding-bottom:12px}.kind{color:var(--ink2);font-size:13px;text-transform:uppercase;letter-spacing:.06em}
@@ -34,7 +37,7 @@ nav.toc{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;margin:8px 0 16p
 section{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:16px 20px;margin:16px 0;break-inside:avoid}
 .sec-head{display:flex;align-items:center;gap:10px}.sec-head h2{font-size:17px;margin:0;flex:1}.num{color:var(--muted);font-variant-numeric:tabular-nums;font-size:13px}
 .summary{font-size:15px;margin:8px 0 4px}
-figure{margin:8px 0}svg.chart{width:100%;height:auto;display:block}
+figure{margin:8px 0;overflow-x:auto}svg.chart{width:100%;height:auto;display:block}
 svg text{font-family:inherit}svg .lbl{fill:var(--ink);font-size:12px}svg .val,svg .axis{fill:var(--ink2);font-size:11px;font-variant-numeric:tabular-nums}
 svg .bar{fill:var(--series)}svg .base{stroke:var(--base);stroke-width:1}svg .grid{stroke:var(--grid);stroke-width:1}svg .threshold{stroke:var(--critical);stroke-width:1}
 svg .band1{fill:#c3c2b7}svg .band2{fill:#d4d3cb}svg .band3{fill:#e6e5df}svg .actual{fill:var(--ink)}svg .target{stroke:var(--ink);stroke-width:2}
@@ -47,9 +50,10 @@ details.tbl summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:6
 th{color:var(--ink2);font-weight:600}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .notes h3,.appendix h3,footer h3{font-size:12.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);margin:10px 0 4px}.notes ul{margin:0;padding-left:18px}
 .appendix h2,footer h2{font-size:17px}
-footer{font-size:12.5px;color:var(--ink2);border-top:2px solid var(--ink);margin-top:24px;padding-top:12px}footer p{margin:4px 0}
+footer{font-size:12.5px;color:var(--ink2);border-top:2px solid var(--ink);margin-top:24px;padding-top:12px;overflow-wrap:anywhere}
+.summary,.notes li,.options,.verdict p{overflow-wrap:anywhere}footer p{margin:4px 0}
 @media (max-width:1000px){.tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media (max-width:720px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}dl.facts{grid-template-columns:repeat(2,minmax(0,1fr))}section{padding:12px}}
+@media (max-width:720px){svg.chart{min-width:640px}.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}dl.facts{grid-template-columns:repeat(2,minmax(0,1fr))}section{padding:12px}}
 @media print{@page{size:A4;margin:12mm}:root{color-scheme:light}body{background:#fff}main{max-width:none;padding:0}nav.toc{display:none}
 details.tbl>summary{display:none}section{border-color:#ccc}}
 """
@@ -148,7 +152,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
     if not series or not series[0][1]:
         return ""
     width, height, x0, x1, y0, y1 = 760, 220, 72, 740, 190, 14
-    labels = [p[0] for p in series[0][1]]
+    labels = sorted({p[0] for _, pts in series for p in pts})  # one shared time axis: series may skip different buckets
+    at = {label: i for i, label in enumerate(labels)}
     peak = max([v for _, pts in series for _, v in pts] + ([threshold] if threshold is not None else []) + [0.0])
     step = 10 ** max(0, len("{:.0f}".format(peak)) - 1) / 2 or 1.0
     top = max(step, -(-peak * 1.1 // step) * step)
@@ -167,8 +172,11 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
         parts.append('<line class="threshold" x1="{0}" x2="{1}" y1="{2:.1f}" y2="{2:.1f}"/><text class="axis" x="{1}" y="{3:.1f}" text-anchor="end">threshold {4:g}{5}</text>'.format(
             x0, x1, sy(threshold), sy(threshold) - 5, threshold, esc(unit)))
     for k, (name, pts) in enumerate(series):
-        coords = " ".join("{:.1f},{:.1f}".format(sx(i), sy(v)) for i, (_, v) in enumerate(pts))
+        coords = " ".join("{:.1f},{:.1f}".format(sx(at[label]), sy(v)) for label, v in pts)
         parts.append('<polyline fill="none" stroke="{}" stroke-width="2" points="{}"><title>{}</title></polyline>'.format(SERIES[k], coords, esc(name)))
+        # a marker per point, so a series with one point (or isolated ones) still shows; hover gives the value
+        parts += ['<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}"><title>{} {}: {:g}{}</title></circle>'.format(sx(at[label]), sy(v), SERIES[k], esc(name), esc(label), round(v, 3), esc(unit))
+                  for label, v in pts]
     legend = "".join('<span><i style="background:{}"></i>{}</span>'.format(SERIES[k], esc(name)) for k, (name, _) in enumerate(series))
     return ('<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg><figcaption class="legend">{}</figcaption></figure>').format(
         width, height + 10, esc(title), esc(title), "".join(parts), legend)
@@ -242,20 +250,22 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
 
 
 def page(title: str, kind: str, facts: Sequence[Tuple[str, str]], options: str, verdict_status: str, verdict_text: str, banner: str,
-         index: Sequence[Tuple[str, str, str]], tile_html: str, sections_html: str, appendix: Sequence[str], footer: Sequence[Tuple[str, str]]) -> str:
+         index: Sequence[Tuple[str, str, str]], tile_html: str, sections_html: str, appendix: Sequence[str], footer: Sequence[Tuple[str, str]], theme: str = "auto") -> str:
     fact_html = "".join("<div><dt>{}</dt><dd>{}</dd></div>".format(esc(k), esc(v)) for k, v in facts)
     toc = "".join('<a href="#{}"><span class="dot {}"></span>{}</a>'.format(esc(sid), status_of(st)[0], esc(label)) for sid, label, st in index)
     if appendix:
         toc += '<a href="#appendix">Appendix</a>'
     foot = "".join("<h3>{}</h3><p>{}</p>".format(esc(h), esc(t)) for h, t in footer)
     cls = status_of(verdict_status)[0]
-    return ('<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+    if theme not in THEMES:
+        raise ValueError("theme must be one of {}".format(", ".join(THEMES)))
+    return ('<!doctype html>\n<html lang="en"{theme}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>{title}</title><style>{css}</style></head><body><main>'
             '<header class="rpt-head"><div class="kind">{kind}</div><h1>{title}</h1><dl class="facts">{facts}</dl>'
             '<p class="options" data-section-id="report-options">{options}</p></header>'
             '<div class="verdict {cls}" role="status" data-section-id="verdict">{pill}<p>{verdict}</p></div>{banner}'
             '<nav class="toc" aria-label="Sections">{toc}</nav>{tiles}{sections}{appendix}'
             '<footer><h2>About this report</h2>{foot}</footer></main></body></html>\n').format(
-        title=esc(title), css=CSS, kind=esc(kind), facts=fact_html, options=esc(options), cls=cls, pill=pill(verdict_status), verdict=esc(verdict_text),
+        theme="" if theme == "auto" else ' data-theme="{}"'.format(theme), title=esc(title), css=CSS, kind=esc(kind), facts=fact_html, options=esc(options), cls=cls, pill=pill(verdict_status), verdict=esc(verdict_text),
         banner=banner, toc=toc, tiles=tile_html, sections=sections_html,
         appendix='<div id="appendix">{}</div>'.format("".join(appendix)) if appendix else "", foot=foot)
