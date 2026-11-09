@@ -2068,9 +2068,11 @@ class GeneralRuleTests(unittest.TestCase):
                 "security:1.NE": [{"nePk": "1.NE", "fromZone": "1", "toZone": "0", "flows_allowed": 0, "flows_dropped": 50}]}
         appliances = [dict(APPLIANCES[0]), dict(APPLIANCES[1])]  # branch-b unreachable
         for name in report.REPORTS:
-            if name == "incident":
-                continue
             b = phase2_bundle(name, appliances=appliances, **data)
+            if name == "incident":
+                b["data"].update(incident={"from_ms": (NOW - 3600) * 1000, "to_ms": NOW * 1000, "affected": ["1.NE"]}, incident_alarms_stored=True,
+                                 incident_alarms=[{"id": 1, "applianceId": "1.NE", "severity": "MAJOR", "timeOccurredInMills": (NOW - 1800) * 1000}],
+                                 incident_audit=audit)
             if name == "custom":
                 b["options"] = {"parts": ["optimisation", "security"]}
             if name == "site":
@@ -2085,7 +2087,7 @@ class GeneralRuleTests(unittest.TestCase):
     def test_rule_1_the_title_counts_exactly_the_flagged_sections_of_the_index(self):
         m = {"report": "x", "metrics": {}, "headline": None, "attention": ["A"], "section_list": [["a", "A"], ["b-summary", "B"], ["data-gaps", "Data gaps"]],
              "sections": {"a": {"status": "red", "metrics": []}, "b-summary": {"status": "red", "metrics": []}, "data-gaps": {"status": "grey", "metrics": []}}}
-        self.assertIn("the verdict names 1 areas but the index flags 2 (A, B)", report.consistency(m))
+        self.assertIn("the verdict names 1 area but the index flags 2 (A, B)", report.consistency(m))
 
     def test_rule_2_a_count_declared_for_a_table_equals_its_rows(self):
         m = {"report": "x", "metrics": {"n": {"value": 2, "status": "red", "label": "n", "unit": ""}}, "headline": None, "section_list": [["s", "s"]],
@@ -2112,6 +2114,32 @@ class GeneralRuleTests(unittest.TestCase):
         m = {"report": "x", "metrics": {}, "headline": None, "section_list": [["data-gaps", "Data gaps"]],
              "sections": {"data-gaps": {"status": "grey", "metrics": [], "table": [{"appliance": "a", "gap": "x"}, {"appliance": "a", "gap": "y"}]}}}
         self.assertIn("data-gaps: a is listed 2 times", report.consistency(m))
+
+
+class ReviewOfGeneralRulesTests(unittest.TestCase):
+    """Independent review of the six general rules (2026-11-09): a total over kinds must not be a number when a kind is missing."""
+
+    def test_tunnels_down_total_is_no_data_when_a_kind_is_missing(self):
+        m = report.compute(phase2_bundle("noc"))
+        self.assertIsNone(m["metrics"]["tunnels_down"]["value"])
+        m = report.compute(phase2_bundle("noc", tunnels_bonded={"1.NE": {"1": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}))
+        self.assertIsNone(m["metrics"]["tunnels_down"]["value"])  # physical not read: the total is unknown
+        self.assertIn("Tunnels: the physical tunnel state could not be read", " ".join(m["sections"]["data-gaps"]["notes"]))
+
+    def test_rule_7_a_total_is_none_or_the_sum_of_its_parts(self):
+        figures = {"t": {"value": 1, "status": "red", "label": "t", "unit": ""}, "a": {"value": 1, "status": "red", "label": "a", "unit": ""},
+                   "b": {"value": None, "status": None, "label": "b", "unit": ""}}
+        m = {"report": "x", "metrics": figures, "headline": None, "section_list": [["s", "s"]],
+             "sections": {"s": {"status": "red", "metrics": ["t"], "parts": [["t", ["a", "b"]]]}}}
+        self.assertIn("s: t is 1 but its part b has no data", report.consistency(m))
+
+    def test_incident_is_in_the_scenarios(self):
+        self.assertIn("incident", [name for name, _ in GeneralRuleTests().scenarios()])
+
+    def test_rule_1_message_reads_right(self):
+        m = {"report": "x", "metrics": {}, "headline": None, "attention": ["A"], "section_list": [["a", "A"], ["b", "B"]],
+             "sections": {"a": {"status": "red", "metrics": []}, "b": {"status": "red", "metrics": []}}}
+        self.assertIn("the verdict names 1 area but the index flags 2 (A, B)", report.consistency(m))
 
 
 if __name__ == "__main__":

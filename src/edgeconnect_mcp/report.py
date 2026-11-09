@@ -845,7 +845,8 @@ def consistency(metrics: Mapping[str, Any]) -> List[str]:
     titles = dict((str(i[0]), str(i[1])) for i in metrics.get("section_list") or [])
     flagged = [titles[sid] for sid in titles if sid not in NOT_AREAS and (metrics.get("sections") or {}).get(sid, {}).get("status") in ("amber", "red")]
     if "attention" in metrics and list(metrics["attention"]) != flagged:  # rule 1: the verdict and title name what the index flags, no more, no less
-        problems.append("the verdict names {} areas but the index flags {} ({})".format(len(metrics["attention"]), len(flagged), ", ".join(flagged)))
+        n = len(metrics["attention"])
+        problems.append("the verdict names {} area{} but the index flags {} ({})".format(n, "" if n == 1 else "s", len(flagged), ", ".join(flagged)))
     down_now = {(r.get("appliance"), r.get("tunnel")) for sec in (metrics.get("sections") or {}).values() if sec.get("down_now_source")
                 for r in sec.get("table") or []}
     for sid, sec in (metrics.get("sections") or {}).items():
@@ -857,6 +858,13 @@ def consistency(metrics: Mapping[str, Any]) -> List[str]:
                 if figures[mid]["value"] != n:
                     problems.append("{}: {} is {} but the table has {} rows".format(sid, mid, figures[mid]["value"], n) if status is None else
                                     "{}: {} is {} but the table has {} {} rows".format(sid, mid, figures[mid]["value"], n, status))
+        for mid, part_ids in sec.get("parts") or []:  # rule 7: a total over parts is no data when a part is, else their sum
+            if mid in figures and figures[mid].get("value") is not None:
+                none = [k for k in part_ids if (figures.get(k) or {}).get("value") is None]
+                if none:
+                    problems.append("{}: {} is {} but its part {} has no data".format(sid, mid, figures[mid]["value"], none[0]))
+                elif figures[mid]["value"] != sum(figures[k]["value"] for k in part_ids):
+                    problems.append("{}: {} is {} but its parts add up to {}".format(sid, mid, figures[mid]["value"], sum(figures[k]["value"] for k in part_ids)))
         for mid, column, flag in sec.get("sums") or []:  # rule 4: a total taken from a column equals the rows it says it counts
             if mid in figures and figures[mid].get("value") is not None:
                 total = sum(r.get(column) or 0 for r in table if r.get(flag, "yes") == "yes")
@@ -1823,8 +1831,13 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             str(r["tunnel"] or "").startswith("to_{}_".format(n)) for n in down_names) else ""
     tunnel_ids.append(metric("tunnels_down_peer_unreachable", sum(bool(r["unreachable_end"]) for r in tunnel_rows), "tunnels",
                              "Tunnels down where one end is an unreachable appliance"))
-    tunnel_ids.insert(0, metric("tunnels_down", len(tunnel_rows), "tunnels", "Tunnels down (bonded and physical)", worst(tunnel_status)))
-    sections["noc-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_ids, "table": tunnel_rows, "counts": [["tunnels_down", None]], "down_now_source": True,
+    parts = ["tunnels_bonded_down", "tunnels_physical_down"]
+    missing = [k for k in parts if metrics_of(ctx, k) is None]  # a total over kinds is unknown when any kind was not read
+    for k in missing:
+        gaps.append("Tunnels: the {} tunnel state could not be read, so the total of tunnels down is not shown.".format(k.split("_")[1]))
+    tunnel_ids.insert(0, metric("tunnels_down", None if missing else len(tunnel_rows), "tunnels", "Tunnels down (bonded and physical)",
+                                None if missing else worst(tunnel_status)))
+    sections["noc-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_ids, "table": tunnel_rows, "counts": [["tunnels_down", None]], "parts": [["tunnels_down", parts]], "down_now_source": True,
                                "notes": ["Rule: any tunnel not up is amber; more than 10% of tunnels is red. Bonded tunnels are the overlays, listed first; physical tunnels are the underlay.",
                                          "Down - In progress: the appliance is still trying to bring the tunnel up (its keepalives or IPsec negotiation are not completing)."]}
 
@@ -2030,6 +2043,10 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if read_now and not read_before:
         ctx["gaps"].append("Traffic: the previous period could not be read, so the change is not shown.")
     return sections
+
+
+def metrics_of(ctx: Dict[str, Any], mid: str) -> Any:
+    return (ctx["metrics"].get(mid) or {}).get("value")
 
 
 def metrics_status(ctx: Dict[str, Any], mid: str) -> str:
