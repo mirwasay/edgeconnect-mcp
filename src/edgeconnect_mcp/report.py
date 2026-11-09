@@ -90,10 +90,13 @@ SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
 MAX_ALARMS = 10000
 WINDOW_PERIODS = {"last-24-hours": 86400, "last-7-days": 7 * 86400}  # rolling windows ending now, for reports that read stats aggregates
 DEFAULT_PERIOD = dict({r: "last-7-days" for r in ("traffic", "paths", "operations", "optimisation", "security", "activity", "site", "custom")}, health="last-24-hours")  # every other report defaults to DEFAULT_OPTIONS["period"]
+INFORMATIONAL = "Informational: this table has no rule; Good means the data was read, not that the figures are good."
 TRAFFIC_TOP = 100000  # `top` sent so the Orchestrator returns every application, domain and port, not its default ten
 TALKERS_CAP = 100  # GET /stats/aggregate/topTalkers returns at most 100 per appliance whatever `top` asks (seteam, 10.0, 2026-11-08)
 TRAFFIC_PATHS = ("/stats/aggregate/application2", "/stats/aggregate/topTalkers", "/stats/aggregate/dns", "/stats/aggregate/ports", "/stats/aggregate/trafficClass")
 PROTOCOLS = {6: "tcp", 17: "udp", 1: "icmp"}
+COUNTRY_ALIASES = {"United States": "United States of America"}  # the Orchestrator's country list names the US both ways
+RESERVED_RANGES = ("RFC1918", "RFC5736", "RFC2544", "RFC6598", "RFC3927", "Link-Local", "Loopback", "Multicast")  # address classes, not countries
 TRAFFIC_TYPES = ("all_traffic", "optimized_traffic", "pass_through_shaped", "pass_through_unshaped")
 DSCP_NAMES = {0: "be", 8: "cs1", 10: "af11", 16: "cs2", 18: "af21", 24: "cs3", 26: "af31", 32: "cs4", 34: "af41", 40: "cs5", 46: "ef", 48: "cs6", 56: "cs7"}  # maxAlarms sent; a list this long may be cut, so it is reported as a gap
 # Loss % is lost / (received + lost) packets. Below this many received packets in the period a loss % means little (the loss
@@ -119,8 +122,13 @@ EXEC_SOURCES = {"exec-availability": ("avail-appliances", "avail-tunnels", "avai
                 "exec-lifecycle": ("life-backups", "life-advisories"),
                 "paths-ranked": ("avail-paths",), "paths-summary": ("avail-paths",), "exec-paths": ("avail-paths", "paths-fec"),
                 "ops-state": ("noc-appliances",), "ops-alarms": ("noc-alarms",), "ops-health": ("noc-health",), "ops-tunnels": ("noc-tunnels",),
-                "ops-paths": ("avail-paths",), "ops-capacity": ("cap-links",)}
-# Follow-up reports suggested under each section, by section prefix: the reader moves on by intent, not by menu.
+                "ops-paths": ("avail-paths",), "ops-capacity": ("cap-links",), "inc-paths": ("avail-paths",), "exec-fleet": ("noc-appliances",)}
+# Follow-up reports suggested under each section: by section id where one fits better, else by prefix. The reader moves on by intent.
+NEXT_SECTION = {"noc-alarms": ("activity", "incident"), "noc-tunnels": ("paths", "availability"), "noc-health": ("paths",), "noc-appliances": ("availability", "incident"),
+                "noc-worst": ("site",), "paths-transport": ("availability",), "paths-fec": ("capacity",), "paths-dscp": ("traffic",), "cap-qos": ("traffic", "paths"),
+                "cap-links": ("traffic",), "act-changes": ("incident",), "act-alarms": ("noc",), "act-after-change": ("incident",), "life-backups": ("noc",),
+                "life-inventory": ("availability",), "avail-alarms": ("noc", "activity"), "avail-tunnels": ("paths",), "inc-changes": ("activity",), "inc-paths": ("paths",),
+                "sec-pairs": ("activity",), "opt-apps": ("traffic",), "traffic-talkers": ("site",)}
 NEXT = {"avail": ("paths", "incident"), "noc": ("health", "paths", "activity"), "health": ("paths", "activity", "site"), "ops": ("paths", "capacity", "activity"),
         "cap": ("traffic", "paths"), "traffic": ("capacity", "optimisation"), "paths": ("availability", "site"), "opt": ("traffic",), "sec": ("activity",),
         "act": ("incident", "noc"), "life": ("executive",), "exec": ("operations", "availability", "traffic"), "inc": ("activity", "paths")}
@@ -731,6 +739,15 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         down_share = _pct(len(inventory) - len(reachable_now), len(inventory))
         fleet_status = "grey" if down_share is None else "green" if not down_share else "red" if down_share > 10 else "amber"
         m_now = metric("reachable_now_pct", _pct(len(reachable_now), len(inventory)), "%", "Appliances reachable at collection time", fleet_status)
+        if "fleet_reach_pct" in metrics:  # the period average next to now, with how many appliances it covers
+            measured = metrics.get("appliances_measured", {}).get("value")
+            metrics["fleet_reach_pct"]["label"] += " ({}{:,} of {:,} reachable now)".format(
+                "{:,} of {:,} appliances measured; ".format(measured, len(inventory)) if measured is not None and measured < len(inventory) else "", len(reachable_now), len(inventory))
+        if metrics.get("traffic_days_covered", {}).get("value") is not None and "wan_bytes_total" in metrics:
+            days = metrics["traffic_days_covered"]["value"]
+            span = ctx["period_s"] / 86400
+            if days < span - 1:
+                metrics["wan_bytes_total"]["label"] += " ({:g} of {:g} days with data)".format(days, round(span))
         metric("reachable_now", len(reachable_now), "appliances", "Appliances reachable at collection time")
         sections["exec-fleet"] = {"status": fleet_status, "metrics": [m_total, "reachable_now", m_now],
                                   "notes": ["Rule: any appliance down is amber; more than 10% down is red. The appliance list is in the availability and NOC reports."]}
@@ -761,6 +778,9 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
             for r in rows:
                 r["tunnel_now"] = "down" if (r["appliance"], r["tunnel"]) in down_now else ""
             sections["paths-ranked"]["notes"].append("Tunnel now: down when the tunnel is down at collection time, whatever its grade over the period.")
+    for sec in sections.values():  # the figure that sets a Warning or Critical status comes first (it is what a reader and the summary cite first)
+        if sec.get("status") in ("amber", "red") and sec.get("metrics"):
+            sec["metrics"] = sorted(sec["metrics"], key=lambda mid: (metrics.get(mid, {}).get("status") != sec["status"], metrics.get(mid, {}).get("status") is None))
     for sid, sec in sections.items():  # possible causes and actions: only card entries whose conditions hold
         sources = EXEC_SOURCES.get(sid, (sid,))
         sec["causes"], sec["actions"] = _eligible(sources, metrics, "causes"), _eligible(sources, metrics, "actions")
@@ -883,8 +903,11 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if always_down:
         notes.append("Tunnels down for the whole period (up less than 1% of it) are usually unused or decommissioned paths; they are {} and listed at the end of this section.".format(
                      "left out of the figures above" if separate else "counted in the figures above"))
-    apart = [{"appliance": r["appliance"], "kind": r["kind"], "label": "" if r["label"] in (None, "none") else r["label"],
-              "service": "" if r["service"] in (None, "none", "unassigned") else r["service"], "tunnels": r["tunnels"]} for r in always_down]
+    merged: Dict[Tuple[Any, ...], int] = {}
+    for r in always_down:  # identical groups (same appliance, kind, label, service) are one row with their tunnels added up
+        key = (r["appliance"], r["kind"], "" if r["label"] in (None, "none") else r["label"], "" if r["service"] in (None, "none", "unassigned") else r["service"])
+        merged[key] = merged.get(key, 0) + int(r["tunnels"] or 1)
+    apart = [{"appliance": a, "kind": k, "label": l, "service": sv, "tunnels": n} for (a, k, l, sv), n in merged.items()]
     sections["avail-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_metrics, "table": tunnel_rows, "notes": notes,
                                  "apart": {"title": "Listed apart: tunnel groups down for the whole period", "rows": apart}}
 
@@ -898,13 +921,16 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                     "so the counts are not shown.")
     if isinstance(listed, list) and data.get("appliance_alarms_capped", len(listed) >= MAX_ALARMS):
         gaps.append("Alarms in the period: the list reached the {}-alarm cap, so the counts may be low.".format(MAX_ALARMS))
+    grouped_alarms: Dict[Tuple[Any, str, str], int] = {}
     if isinstance(listed, list):
         for alarm in listed:
             sev = str(alarm.get("severity") or "").upper()
             if sev in counts:
                 counts[sev] += 1
-            alarm_rows.append({"appliance": names.get(alarm.get("applianceId"), alarm.get("applianceId")), "severity": sev.lower(), "description": str(alarm.get("description") or "")[:160]})
-        alarm_rows.sort(key=lambda r: SEVERITY_ORDER.get(r["severity"], len(SEVERITY_ORDER)))
+            key = (names.get(alarm.get("applianceId"), alarm.get("applianceId")), sev.lower(), str(alarm.get("description") or "")[:160])
+            grouped_alarms[key] = grouped_alarms.get(key, 0) + 1
+        alarm_rows = [{"appliance": a, "severity": sev, "description": d, "count": n} for (a, sev, d), n in grouped_alarms.items()]  # the same alarm on one appliance: one row
+        alarm_rows.sort(key=lambda r: (SEVERITY_ORDER.get(r["severity"], len(SEVERITY_ORDER)), -r["count"]))
         source = "POST /alarm/appliance"
     else:
         for ne in names:
@@ -1125,7 +1151,7 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         walk(ctx["data"].get("dscp:" + str(ne)))
     dscp_rows = _shares(by_dscp, "dscp")
     sections["paths-dscp"] = {"status": "green" if dscp_rows else "grey", "metrics": [], "table": dscp_rows,
-                              "notes": ["WAN bytes by DSCP marking, all traffic. Voice is usually ef (46); video af41 (34)."]}
+                              "notes": ["WAN bytes by DSCP marking, all traffic. Voice is usually ef (46); video af41 (34).", INFORMATIONAL]}
     sections["paths-summary"] = {"status": worst([ranked["status"], sections["paths-fec"]["status"]]),
                                  "metrics": [m for m in ("paths_ok_pct", "paths_graded", "paths_red", "paths_amber", "paths_no_data", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
     return sections
@@ -1215,7 +1241,7 @@ def _optimisation(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     extra = {"opt-apps": {"status": "green" if app_rows else "grey", "metrics": [], "table": app_rows,
                           "notes": ["LAN bytes against WAN bytes per application, all traffic types, so its totals are larger than the optimised-traffic figures above and do not "
                                     "add up to them; pass-through traffic shows no reduction. A negative saving means the WAN side was larger than the LAN side "
-                                    "(tunnel and FEC overhead on traffic that cannot be reduced)."]},
+                                    "(tunnel and FEC overhead on traffic that cannot be reduced).", INFORMATIONAL]},
              "opt-boost": {"status": "green" if boost else "grey", "metrics": [], "table": boost,
                            "notes": ["Boost adds bandwidth to chosen traffic above the appliance's licensed rate. Configured: the Boost rate set (kbps); boosted: bytes sent with Boost; "
                                      "seconds not boosted: time when traffic wanted Boost and none was left."] if boost else ["No Boost data: Boost is not licensed or not used on these appliances."]}}
@@ -1482,7 +1508,9 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     share = _pct(not_normal, len(inventory))
     state_status = "grey" if not inventory else "green" if not not_normal else "red" if share > 10 else "amber"
     paused = set(((data.get("maintenance") or {}).get("pauseOrchestration") or []) if isinstance(data.get("maintenance"), dict) else [])
-    sections["noc-appliances"] = {"status": state_status, "metrics": [metric("state_" + name.replace(" ", "_"), counts[name], "appliances", "Appliances " + name)
+    sections["noc-appliances"] = {"status": state_status, "metrics": [metric("state_" + name.replace(" ", "_"), counts[name], "appliances", "Appliances " + name,
+                                                                             None if name == "normal" or not inventory else "green" if not counts[name]
+                                                                             else "red" if _pct(counts[name], len(inventory)) > 10 else "amber")
                                                                       for name in STATE_NAMES.values()],
                                   "table": [{"appliance": names[ne], "state": st, "maintenance": "yes" if ne in paused else ""} for ne, st in sorted(state_of.items(), key=lambda i: str(names[i[0]])) if st != "normal"],
                                   "notes": ["Rule: any appliance not normal is amber; more than 10% is red."]}
@@ -1539,7 +1567,9 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     new_24h = sum(1 for a in active if isinstance(a.get("timeOccurredInMills"), (int, float)) and a["timeOccurredInMills"] / 1000 >= now_s - 86400
                   and str(a.get("severity") or "").lower() in sev_counts) if isinstance(active, list) else None
     sections["noc-alarms"] = {"status": alarm_status, "notes": notes, "table": rows,
-                              "metrics": [metric("active_" + sev, n, "alarms", "Active {} alarms".format(sev)) for sev, n in sev_counts.items()]
+                              "metrics": [metric("active_" + sev, n, "alarms", "Active {} alarms".format(sev),
+                                                 None if n is None or sev in ("minor", "warning") else ("red" if sev == "critical" else "amber") if n else "green")
+                                          for sev, n in sev_counts.items()]
                               + [metric("active_new_24h", new_24h, "alarms", "Active alarms raised in the last 24 hours")]}
 
     # Health: share of appliance-hours in good health (POST /health hourly entries; blank hours are not counted). Read once per
@@ -1590,6 +1620,10 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                                                                                              "status": band(pct, (95.0, 99.0))}
             table.append(row)
         ranked = lambda r: [c for k, c in r.items() if k != "appliance" and not k.endswith(" (not counted)")]
+        for row in table:  # columns that carry nothing: a category no appliance was rated on, and one left out of the headline (its own row stays in the figure)
+            for v in per_category:
+                if shares[v]["24h"]["all"] is None or v in setting:
+                    row.pop(_cap(HEALTH_LABELS[v]) + (" (not counted)" if v in setting else ""), None)
         for v in per_category:
             if shares[v]["24h"]["all"] is None:
                 gaps.append("Health: the Orchestrator rated no appliance on {} in the last 24 hours, so that column is empty.".format(HEALTH_LABELS[v]))
@@ -1771,7 +1805,7 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     m_top = metric("top_app_share_pct", app_rows[0]["share_pct"] if app_rows else None, "%", "Largest application's share of WAN traffic")
     m_apps = metric("applications_seen", len(app_rows), "applications", "Applications with traffic")
     m_days = metric("traffic_days_covered", covered, "days", "Days of the period with application data")
-    sections["traffic-apps"] = {"status": status, "metrics": [m_apps, m_top], "table": app_rows,
+    sections["traffic-apps"] = {"status": status, "metrics": [m_apps, m_top], "table": app_rows, "notes": [INFORMATIONAL],
                                 "chart": {"title": "Share of WAN traffic by application, % (largest 15)", "zoom": False,
                                           "points": [(r["application"], r["share_pct"]) for r in app_rows[:15] if r["share_pct"] is not None]}}
     talkers = []
@@ -1781,7 +1815,9 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 talkers.append({"appliance": name, "source_ip": row.get("SOURCE_IP"), "wan_bytes": _wan(row, "WANTX_BYTES", "WANRX_BYTES")})
     talkers.sort(key=lambda r: -r["wan_bytes"])
     sections["traffic-talkers"] = {"status": "green" if talkers else "grey", "metrics": [], "table": talkers,
-                                   "notes": ["The Orchestrator returns the top talkers capped at {} per appliance, so smaller talkers are not listed.".format(TALKERS_CAP)]}
+                                   "notes": ["The Orchestrator returns the top talkers capped at {} per appliance, so smaller talkers are not listed.".format(TALKERS_CAP),
+                                             "Each address is counted for the traffic it sent or received, so both ends of one large flow appear, often with the same bytes.",
+                                             INFORMATIONAL]}
     domains: Dict[str, int] = {}
     countries: Dict[str, int] = {}
     ports: Dict[str, int] = {}
@@ -1790,16 +1826,20 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             n = _wan(row, "WANTX_BYTES", "WANRX_BYTES")
             domain = str(row.get("DNS") or row.get("CALC_DNS") or row.get("IPADDR") or "unknown")
             country = str(row.get("COUNTRY") or "unknown")
+            country = COUNTRY_ALIASES.get(country, "Private and reserved addresses" if country in RESERVED_RANGES else country)
             domains[domain] = domains.get(domain, 0) + n
             countries[country] = countries.get(country, 0) + n
         for row in _header_rows(data.get("ports:" + str(ne))):
             key = "{}/{}".format(row.get("PORT"), PROTOCOLS.get(row.get("PROTOCOL"), row.get("PROTOCOL")))
             ports[key] = ports.get(key, 0) + _wan(row, "WANTX_BYTES", "WANRX_BYTES")
     for sid, totals, key, note in (("traffic-domains", domains, "domain", "Named by DNS where the appliance saw the lookup, else by IP address."),
-                                   ("traffic-countries", countries, "country", "RFC1918 is private address space (inside your network)."),
+                                   ("traffic-countries", countries, "country", "Private and reserved addresses: RFC1918 private space (inside your network) and the other "
+                                                                               "reserved ranges (RFC5736, RFC2544, link-local), which are not countries."),
                                    ("traffic-ports", ports, "port", "Port and protocol of the flows, both directions.")):
         rows = _shares(totals, key)
-        sections[sid] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": [note],
+        basis = "Share: of this table's own total ({}). The Orchestrator counts this table its own way (both ends of a flow, both directions), so its total differs " \
+                "from the WAN traffic figure above.".format(layout.human_bytes(sum(totals.values())))
+        sections[sid] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": [note, basis, INFORMATIONAL],
                          "chart": {"title": "Share of WAN traffic, % (largest 15)", "zoom": False, "points": [(r[key], r["share_pct"]) for r in rows[:15] if r["share_pct"] is not None]}}
     classes: Dict[str, int] = {}
 
@@ -1817,7 +1857,8 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for ne in names:
         walk(data.get("classes:" + str(ne)))
     rows = _shares(classes, "traffic_class")
-    sections["traffic-classes"] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": ["Traffic classes as defined in the QoS (shaper) policy, all traffic types."]}
+    sections["traffic-classes"] = {"status": "green" if rows else "grey", "metrics": [], "table": rows,
+                                   "notes": ["Traffic classes as defined in the QoS (shaper) policy, all traffic types. Share: of this table's own total.", INFORMATIONAL]}
     per_bucket: Dict[float, int] = {}
     for ne in names:
         for row in _columns(data.get("trend:" + str(ne))):
@@ -1883,13 +1924,13 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                     values.append(pct)
         p95_tx, p95_rx = _p95(tx), _p95(rx)
         peak = max([v for v in (p95_tx, p95_rx) if v is not None], default=None)
-        peak_hour = max(sorted(by_hour), key=lambda h: statistics.mean(by_hour[h])) if by_hour else None
+        peak_hour = max(sorted(by_hour), key=lambda h: statistics.mean(by_hour[h])) if by_hour and any(any(v) for v in by_hour.values()) else None
         now_avg = max(link["avg_tx_pct"] or 0, link["avg_rx_pct"] or 0)
         status = _load_status(peak, limits)
         rows.append({"appliance": names.get(link["nePk"], link["nePk"]), "interface": link["interface"], "label": link["label"],
                      "outbound_mbps": round(link["bw_tx"] / 1000, 1), "inbound_mbps": round(link["bw_rx"] / 1000, 1),
                      "avg_out_pct": link["avg_tx_pct"], "avg_in_pct": link["avg_rx_pct"], "p95_out_pct": p95_tx, "p95_in_pct": p95_rx,
-                     "buckets": max(len(tx), len(rx)), "peak_hour_utc": "{:02d}:00".format(peak_hour) if peak_hour is not None else None,
+                     "samples": max(len(tx), len(rx)), "peak_hour_utc": "{:02d}:00".format(peak_hour) if peak_hour is not None else None,
                      "avg_change_pts": round(now_avg - before[(link["nePk"], link["interface"])], 2) if (link["nePk"], link["interface"]) in before else None,
                      "top_applications": _drivers(data.get("apps:" + str(link["nePk"]))) if status in ("amber", "red") else "", "check": _bandwidth_note(link), "status": status})
     for column in ("top_applications", "check", "label"):  # columns that are empty on every row are left out
@@ -1911,7 +1952,9 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         "P95 of daily averages: the period is older than the hourly data the Orchestrator keeps, and daily averages understate peaks much more than hourly ones."
     notes = [window, "Outbound = WAN Tx, inbound = WAN Rx, against the configured bandwidth. Rule: P95 at or above {:g}% is amber, {:g}% red (bwUtilization limits).".format(*sorted(limits)),
              "Rows sorted by the higher of P95 out and P95 in, highest first. Average utilisation from {}; bandwidth columns are the configured rates.".format(
-                 links[0]["source"] if links else "the interface totals")]
+                 links[0]["source"] if links else "the interface totals"),
+             "Samples: the {} averages the P95 is taken from. Change in average: percentage points against the period before, of the same length. "
+             "Peak hour: the hour of the day (UTC) with the highest average load; blank when the link carried nothing.".format("hourly" if bucket == 3600 else "daily")]
     if data.get("capacity_top"):
         notes.append("Only the {} busiest links got a P95 read (option --top); the rest stay grey.".format(data["capacity_top"]))
     m_flag = metric("links_flagged", len(flagged) if measured else None, "links", "WAN links at or above {:g}% P95".format(min(limits)), status)
@@ -2094,8 +2137,10 @@ def _fmt(metric: Mapping[str, Any], unit_word: bool = True) -> str:
         return layout.human_bytes(value)
     if value == 1 and unit.endswith("s"):
         unit = unit[:-3] + "y" if unit.endswith("ies") else unit[:-1]  # 1 alarm, 1 advisory
-    if isinstance(value, float):
-        value = "{:,.2f}".format(value)
+    if isinstance(value, float) and value.is_integer() and unit != "%":
+        value = "{:,.0f}".format(value)  # "2 minutes", not "2.00 minutes"
+    elif isinstance(value, float):
+        value = ("{:,.2f}" if unit == "%" else "{:,.1f}").format(value)
     elif isinstance(value, int) and not isinstance(value, bool):
         value = "{:,}".format(value)
     return "{}{}".format(value, unit if unit == "%" else (" " + unit if unit and unit_word else ""))
@@ -2170,7 +2215,7 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
         parts.append(layout.section(sid, number, titles[sid], sec["status"], '<p class="summary">{}</p>'.format(text) if text else "", _figure(sid, sec),
                                     "" if summary_like(sid) else layout.stats([shown(mid) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]), sec.get("table") or [],
                                     sec.get("notes", []), appendix, [c["text"] for c in sec.get("causes", [])], [a["text"] for a in sec.get("actions", [])],
-                                    [TITLES[r] for r in NEXT.get(sid.split("-")[0], ()) if r != name], sec.get("apart"),
+                                    [TITLES[r] for r in NEXT_SECTION.get(sid, NEXT.get(sid.split("-")[0], ())) if r != name], sec.get("apart"),
                                     [_key_point(metrics["metrics"][mid]) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]
                                     if summary_like(sid) else []))
         index.append((sid, "{} {}".format(number, titles[sid]), sec["status"]))

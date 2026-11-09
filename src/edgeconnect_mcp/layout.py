@@ -97,9 +97,10 @@ def bars(title: str, points: Sequence[Tuple[str, float]], zoom: bool) -> str:
     for i, (label, value) in enumerate(points):
         y = top + i * row
         length = 0 if value <= floor else (value - floor) / (ceiling - floor) * (x1 - x0)
-        parts.append('<g><title>{0}: {1:.2f}%</title><text class="lbl" x="{2}" y="{3}" text-anchor="end">{4}</text>'
-                     '<rect class="bar" x="{5}" y="{6}" width="{7:.1f}" height="12" rx="3"/><text class="val" x="{8:.1f}" y="{3}">{1:.2f}%</text></g>'.format(
-                         esc(label), value, x0 - 8, y + 11, esc(str(label)[:34]), x0, y + 1, max(length, 1.5), x0 + max(length, 1.5) + 6))
+        shown = ("{:.3f}" if zoom else "{:.1f}").format(value)  # the same decimals as the table beside it: availability 3, other percentages 1
+        parts.append('<g><title>{0}: {1}%</title><text class="lbl" x="{2}" y="{3}" text-anchor="end">{4}</text>'
+                     '<rect class="bar" x="{5}" y="{6}" width="{7:.1f}" height="12" rx="3"/><text class="val" x="{8:.1f}" y="{3}">{1}%</text></g>'.format(
+                         esc(label), shown, x0 - 8, y + 11, esc(str(label)[:34]), x0, y + 1, max(length, 1.5), x0 + max(length, 1.5) + 6))
     parts.append('<line class="base" x1="{0}" x2="{0}" y1="{1}" y2="{2}"/>'.format(x0, top - 2, top + len(points) * row))
     return '<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg></figure>'.format(
         width, top + len(points) * row + 4, esc(title), esc(title), "".join(parts))
@@ -196,7 +197,7 @@ def human_bytes(n: float) -> str:
 HEADERS = {"nePk": "nePk", "wan_bytes": "WAN traffic", "lan_bytes": "LAN traffic", "saved_bytes": "Saved", "bytes": "Traffic", "mos": "MOS",
            "pre_fec_loss_pct": "Loss before FEC %", "p95_out_pct": "P95 out %", "p95_in_pct": "P95 in %", "avg_out_pct": "Average out %",
            "avg_in_pct": "Average in %", "avg_change_pts": "Change in average (points)", "dscp": "DSCP", "qos_drops": "QoS drops",
-           "source_ip": "Source IP", "bw_utilization": "Utilisation", "alarm": "Alarm", "nepk": "nePk"}
+           "source_ip": "IP address (either end)", "ecos": "ECOS build", "bw_utilization": "Utilisation", "alarm": "Alarm", "nepk": "nePk"}
 
 
 def header(column: str) -> str:
@@ -222,8 +223,12 @@ def number(column: str, value: float) -> str:
         return "{:,.0f}".format(value)
     if column.endswith("drop_pct"):
         return "{:,.4f}".format(value)  # drop rates are tiny: 4 decimals so they do not read as 0
-    if column.endswith("_pct") and 0 < abs(value) < 0.05:
+    if column.endswith("_pct") and 0 < value < 0.05:
         return "<0.1"  # not 0.0: something did happen
+    if column.endswith("_pct") and -0.05 < value < 0:
+        return "0.0"  # not "-0.0"
+    if column.endswith("_kbps"):
+        return "{:,.0f}".format(value)
     return "{:,.1f}".format(value) if column.endswith("_pct") else "{:,.2f}".format(value)
 
 
@@ -243,7 +248,7 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
     """Every row, every column, in the order given; numbers right-aligned; a `status` column shown as a pill."""
     if not rows:
         return ""
-    columns = list(rows[0].keys())
+    columns = [c for c in rows[0].keys() if any(r.get(c) not in ("", None) for r in rows) or any(r.get(c) is None for r in rows)]  # a column blank on every row says nothing
     plain = lambda v: v.get("value") if isinstance(v, dict) else v  # a cell may be {"value": .., "status": ..}, shown with its status icon
     numeric = {c for c in columns if all(isinstance(plain(r.get(c)), (int, float)) and not isinstance(plain(r.get(c)), bool) for r in rows if plain(r.get(c)) is not None)
                and any(plain(r.get(c)) is not None for r in rows)}

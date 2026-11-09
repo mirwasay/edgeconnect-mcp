@@ -75,8 +75,8 @@ class ComputeTests(unittest.TestCase):
         listed = [{"applianceId": "1.NE", "severity": "CRITICAL", "description": "Tunnel down"}, {"applianceId": "2.NE", "severity": "MINOR"}]
         m = report.compute(bundle(appliance_alarms=listed))
         self.assertEqual((m["metrics"]["alarms_critical"]["value"], m["metrics"]["alarms_major"]["value"], m["sections"]["avail-alarms"]["status"]), (1, 0, "red"))
-        self.assertEqual(m["sections"]["avail-alarms"]["table"], [{"appliance": "branch-a", "severity": "critical", "description": "Tunnel down"},
-                                                                  {"appliance": "branch-b<script>", "severity": "minor", "description": ""}])  # every alarm, most severe first
+        self.assertEqual(m["sections"]["avail-alarms"]["table"], [{"appliance": "branch-a", "severity": "critical", "description": "Tunnel down", "count": 1},
+                                                                  {"appliance": "branch-b<script>", "severity": "minor", "description": "", "count": 1}])  # every alarm, most severe first; repeats merge
 
     def test_missing_data_is_grey_never_zero_and_listed_as_a_gap(self):
         m = report.compute(bundle(**{"reach:1.NE": [], "reach:2.NE": [], "availability_threshold": {}}))
@@ -153,7 +153,7 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("<script", page)  # the hostile host name is escaped
         self.assertIn("branch-b&lt;script&gt;", page)
         self.assertIn("<svg", page)
-        self.assertIn("<title>branch-a: 99.50%</title>", page)
+        self.assertIn("<title>branch-a: 99.500%</title>", page)  # 3 decimals, as in the table
         self.assertIn("@media print", page)
         self.assertIn("Bundle SHA-256 abc", page)
         self.assertNotRegex(page, r"(?i)<(link|img|iframe)\b|src=|https?://")
@@ -871,7 +871,7 @@ class LayoutTests(unittest.TestCase):
         hours = HealthByCategoryTests.hours
         data = {"health:" + cat: {"1.NE": hours("HEALTHY" if cat != "MOS" else "MAJOR")} for cat in ("LOSS", "MOS")}
         page = report.render(report.compute(phase2_bundle("noc", **data)))
-        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0%</span>', page)  # MOS, now a table cell (owner review 2026-11-09)
+        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0.0%</span>', page)  # MOS in the category figure; its column is left out (polish 2026-11-09)
         self.assertIn('<span class="pill good"><span aria-hidden="true">\u2713</span> 100%</span>', page)  # loss
 
 
@@ -1358,7 +1358,7 @@ class ReadabilityTests(unittest.TestCase):
         self.assertNotIn("<svg", sec)  # a table, not a grid
         self.assertIn("% of the last 24 hours that category was rated healthy", sec)
         self.assertIn("0% means it was never healthy", sec)
-        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0%</span>', sec)
+        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0.0%</span>', sec)  # MOS in the category figure
 
     def test_summary_sections_open_with_key_points(self):
         page = report.render(report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}])))
@@ -1414,7 +1414,7 @@ class HealthByCategoryTests(unittest.TestCase):
         notes = " ".join(m["sections"]["noc-health"]["notes"])
         self.assertIn("MOS is unhealthy in most hours while loss, latency and jitter are healthy", notes)
         row = m["sections"]["noc-health"]["table"][0]
-        self.assertEqual((row["appliance"], row["Loss"]["value"], row["MOS (not counted)"]["value"], row["MOS (not counted)"]["status"]), ("branch-a", 100.0, 0.0, "red"))
+        self.assertEqual((row["appliance"], row["Loss"]["value"], "MOS (not counted)" in row), ("branch-a", 100.0, False))  # MOS left out of the table, kept in the figure
 
     def test_collect_reads_health_once_per_category(self):
         client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
@@ -1719,6 +1719,77 @@ class PersonaReviewRound3Tests(unittest.TestCase):
         m = report.compute(phase2_bundle("activity", activity_audit=audit))
         self.assertEqual(dict(m["section_list"])["act-after-change"], "Alarms within an hour of a change by a person")
         self.assertIn("can appear in both rows", " ".join(m["sections"]["act-changes"]["notes"]))
+
+
+class PolishTests(unittest.TestCase):
+    """Owner, 2026-11-09: fix every readability point the readers raised that needs no new data."""
+
+    path = PersonaReviewTests.path
+
+    def test_1_a_section_leads_with_the_figure_that_sets_its_status(self):
+        m = report.compute(phase2_bundle("noc", appliances=[dict(APPLIANCES[0]), dict(APPLIANCES[1])]))  # branch-b unreachable
+        first = m["sections"]["noc-appliances"]["metrics"][0]
+        self.assertEqual(first, "state_unreachable")
+        self.assertEqual(report.template(m)["sections"]["noc-appliances"]["cite"][0], "state_unreachable")
+
+    def test_2_count_tiles_carry_a_status(self):
+        m = report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}]))
+        self.assertEqual((m["metrics"]["state_unreachable"]["status"], m["metrics"]["active_critical"]["status"], m["metrics"]["active_major"]["status"]), ("red", "red", "green"))
+
+    def test_3_sections_with_a_problem_get_an_action(self):
+        rows = [{"nePk": "1.NE", "fromZone": "3", "toZone": "0", "flows_allowed": 0, "flows_dropped": 50}]
+        m = report.compute(phase2_bundle("security", **{"security:1.NE": rows}))
+        self.assertTrue(m["sections"]["sec-pairs"]["actions"])
+        lic = report.compute(phase2_bundle("lifecycle", gms_license={"daysToExpiration": 500}, portal_appliances={"data": []}))
+        self.assertTrue(lic["sections"]["life-licences"]["actions"])
+
+    def test_4_next_reports_fit_the_section(self):
+        page = report.render(report.compute(phase2_bundle("noc")))
+        alarms = page[page.index('id="noc-alarms"'):page.index('id="noc-health"')]
+        tunnels = page[page.index('id="noc-tunnels"'):page.index('id="noc-worst"')]
+        self.assertNotEqual(re.search(r"Next: [^<]*", alarms).group(0), re.search(r"Next: [^<]*", tunnels).group(0))
+
+    def test_5_columns_empty_on_every_row_are_left_out_and_repeats_merge(self):
+        html_table = layout.table([{"appliance": "a", "label": "", "tunnels": 1}, {"appliance": "b", "label": "", "tunnels": 2}])
+        self.assertNotIn(">Label<", html_table)
+        listed = [{"applianceId": "1.NE", "severity": "MAJOR", "description": "Overlay Tunnel is down"}] * 3
+        rows = report.compute(bundle(appliance_alarms=listed))["sections"]["avail-alarms"]["table"]
+        self.assertEqual((len(rows), rows[0]["count"]), (1, 3))
+
+    def test_6_capacity_columns_are_explained_and_ecos_is_named(self):
+        notes = " ".join(report.compute(phase2_bundle("capacity"))["sections"]["cap-links"]["notes"])
+        for word in ("Samples:", "Change in average:", "Peak hour:"):
+            self.assertIn(word, notes)
+        self.assertEqual(layout.header("ecos"), "ECOS build")
+
+    def test_7_one_number_style(self):
+        self.assertEqual(layout.number("reduction_pct", -0.04), "0.0")
+        self.assertEqual(layout.number("boost_configured_kbps", 25000.0), "25,000")
+        self.assertEqual(report._fmt({"value": 2.0, "unit": "minutes"}), "2 minutes")
+        self.assertIn(">45.1%<", layout.bars("t", [("a", 45.14)], False))
+
+    def test_8_traffic_merges_country_names_and_says_what_each_share_is_of(self):
+        rows = [dns_row("1.NE", "a.com", "United States", 10, 0), dns_row("1.NE", "b.com", "United States of America", 10, 0), dns_row("1.NE", "c", "RFC1918", 5, 0)]
+        m = report.compute(phase2_bundle("traffic", **{"dns:1.NE": [{"1.NE": rows}, {"header": [DNS_HEADER]}]}))
+        countries = [r["country"] for r in m["sections"]["traffic-countries"]["table"]]
+        self.assertEqual(countries, ["United States of America", "Private and reserved addresses"])
+        self.assertIn("of this table's own total", " ".join(m["sections"]["traffic-domains"]["notes"]))
+        self.assertEqual(layout.header("source_ip"), "IP address (either end)")
+
+    def test_9_executive_tiles_carry_their_denominators(self):
+        m = report.compute(phase2_bundle("executive", appliances=[dict(APPLIANCES[0]), dict(APPLIANCES[1])]))
+        self.assertIn("reachable now", m["metrics"]["fleet_reach_pct"]["label"])
+
+    def test_10_health_table_hides_columns_with_nothing_in_them(self):
+        h = HealthByCategoryTests.hours
+        data = {"health:LOSS": {"1.NE": h("HEALTHY")}, "health:LATENCY": {"1.NE": h("HEALTHY")}, "health:JITTER": {"1.NE": h("HEALTHY")},
+                "health:MOS": {"1.NE": h("MAJOR")}, "health:BW_UTILIZATION": {}}
+        row = report.compute(phase2_bundle("noc", **data))["sections"]["noc-health"]["table"][0]
+        self.assertEqual(sorted(row), ["Jitter", "Latency", "Loss", "appliance"])
+
+    def test_11_descriptive_sections_say_they_have_no_rule(self):
+        m = report.compute(phase2_bundle("traffic", **{"dns:1.NE": [{"1.NE": [dns_row("1.NE", "a.com", "Spain", 10, 0)]}, {"header": [DNS_HEADER]}]}))
+        self.assertIn("Informational", " ".join(m["sections"]["traffic-countries"]["notes"]))
 
 
 if __name__ == "__main__":
