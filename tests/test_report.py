@@ -334,7 +334,7 @@ class Phase2CollectTests(CollectTests):
         client = RoutedClient(self.answers())
         report.collect(self.server(client, get_only=False), "lab", "capacity", "2026-09", top=1, now=datetime(2026, 9, 21, tzinfo=timezone.utc))
         self.assertEqual([(c[0], c[1], (c[2] or {}).get("interfaceName")) for c in client.calls if c[1].startswith("/stats")],
-                         [("POST", "/stats/aggregate/interface", None), ("GET", "/stats/timeseries/interface", "wan0")])
+                         [("POST", "/stats/aggregate/interface", None), ("POST", "/stats/aggregate/interface", None), ("GET", "/stats/timeseries/interface", "wan0")])  # period, previous period
 
     def test_noc_and_lifecycle_requests(self):
         client = RoutedClient(self.answers())
@@ -984,6 +984,35 @@ class PathQualityTests(unittest.TestCase):
 
     def test_paths_defaults_to_the_last_7_days_hourly(self):
         self.assertEqual(report.DEFAULT_PERIOD["paths"], "last-7-days")
+
+
+class CapacityPlanningTests(unittest.TestCase):
+    """R5: per busy link, its peak hour, change against the previous period, and the applications behind it."""
+
+    def test_peak_hour_change_and_drivers(self):
+        load = lambda t: 99 if t // 3600 % 24 == 14 else 95 if 9 <= t // 3600 % 24 <= 13 else 10  # business hours busy, 14:00 busiest
+        hours = [{"timestamp": NOW - 3600 * (h + 1), "tx_bytes": 45000000000 * load(NOW - 3600 * (h + 1)) / 100, "rx_bytes": 0,
+                  "max_bw_tx": 100000, "max_bw_rx": 100000} for h in range(240)]
+        previous = [dict(CapacityTests.TOTALS[0], SUM_TX_BYTES=CapacityTests.TOTALS[0]["SUM_TX_BYTES"] / 2)]
+        app = lambda name, n: {"nePk": "1.NE", "APPNAME": name, "SUM_WTX_BYTES": n, "SUM_WRX_BYTES": 0}
+        m = report.compute(phase2_bundle("capacity", interface_totals=CapacityTests.TOTALS, interface_totals_previous=previous,
+                                         **{"hourly:1.NE:wan0": hours, "apps:1.NE": [app("__total__", 100), app("Backup", 60), app("Zoom", 30)]}))
+        row = next(r for r in m["sections"]["cap-links"]["table"] if r["interface"] == "wan0")
+        self.assertEqual(row["peak_hour_utc"], "14:00")
+        self.assertEqual(row["avg_change_pts"], 50.0)  # 100% average now, 50% in the previous period
+        self.assertEqual(row["top_applications"], "Backup 60%, Zoom 30%")
+
+    def test_collect_reads_the_previous_period_and_each_appliances_applications(self):
+        client = RoutedClient(dict(Phase2CollectTests.answers(Phase2CollectTests()), **{"/stats/aggregate/application2": []}))
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(dict(SPEC, paths=dict(SPEC["paths"], **{"/stats/aggregate/application2": {"get": {"summary": "a"}}}))))
+            orchestrator = Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)
+            report.collect(Server({"lab": orchestrator}, default="lab", log=lambda line: None), "lab", "capacity", "2026-09", now=datetime(2026, 9, 21, tzinfo=timezone.utc))
+        posts = [c[2] for c in client.calls if c[1] == "/stats/aggregate/interface"]
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[1]["endTime"], posts[0]["startTime"])  # the previous period, same length
+        self.assertEqual(sorted(c[2]["nePk"] for c in client.calls if c[1] == "/stats/aggregate/application2"), ["1.NE", "2.NE"])
 
 
 class HealthByCategoryTests(unittest.TestCase):

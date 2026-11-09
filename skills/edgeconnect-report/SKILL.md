@@ -13,7 +13,7 @@ description: Use when the user asks for an EdgeConnect or Orchestrator report (m
 | --- | --- | --- |
 | availability, service level, uptime, monthly SLA, loss, latency, jitter, MOS | `availability` | summary, appliance reachability, tunnel availability (overlay and underlay), path quality per tunnel, alarms in the period, data gaps |
 | NOC digest, what is broken now, daily ops, worst sites | `noc` | appliance state, active alarms, health (last 24 hours and 7 days), tunnels down, sites needing attention |
-| WAN capacity, link utilisation, bandwidth, P95, upgrade circuits | `capacity` | WAN links ranked by P95 utilisation against configured bandwidth |
+| WAN capacity, link utilisation, bandwidth, P95, upgrade circuits | `capacity` | WAN links ranked by P95 utilisation against configured bandwidth, with each link's peak hour, change in average load against the previous period, and for busy links the appliance's largest applications |
 | lifecycle, licences, backups, software versions, vulnerabilities, advisories, CVE | `lifecycle` | inventory and ECOS trains, licence expiry, last backups, known advisories, hardware end of life (grey: no API) |
 | major incident, outage review, post-incident, what happened at | `incident` | alarm timeline and time to clear, affected appliances' reachability and path quality in the window, changes in and 24 hours before the window |
 | what uses the WAN, top applications, top talkers, domains, countries, ports, traffic classes | `traffic` | traffic summary and change against the previous period, applications with share of WAN traffic, top talkers, domains, countries, ports, traffic classes |
