@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from edgeconnect_mcp import report
+from edgeconnect_mcp import layout, report
 from edgeconnect_mcp.history import History
 from edgeconnect_mcp.config import Config
 from edgeconnect_mcp.server import Orchestrator, Server
@@ -142,7 +142,7 @@ class RenderTests(unittest.TestCase):
         metrics = report.compute(bundle())
         page = report.render(metrics, {"report": "availability", "sections": {"avail-summary": {"text": "Reachability {{m:fleet_reach_pct}} <b>x</b>"},
                                                                      "avail-alarms": {"text": "{{m:alarms_major}} major alarms."}}})
-        self.assertIn("<p>2 major alarms.</p>", page)  # prose tokens carry no unit word
+        self.assertIn('<p class="summary">2 major alarms.</p>', page)  # prose tokens carry no unit word
         self.assertIn(">2 alarms</b>", page)  # tiles do
         ids = [line.split('data-section-id="')[1].split('"')[0] for line in page.split("<section ")[1:]]
         self.assertEqual(ids, [sid for sid, _ in report.SECTIONS["availability"]])
@@ -388,11 +388,10 @@ class PresentationTests(unittest.TestCase):
     def test_singular_units_status_coloured_bars_and_labelled_axis(self):
         self.assertEqual(report._fmt({"value": 1, "unit": "alarms"}), "1 alarm")
         self.assertEqual(report._fmt({"value": 2, "unit": "alarms"}), "2 alarms")
-        svg = report._chart({"title": "t", "zoom": True, "points": [("a", 95.0, "red"), ("b", 100.0, "green")]})
-        self.assertIn('class="bar red"', svg)
-        self.assertIn('class="bar green"', svg)
+        svg = layout.bars("t", [("a", 95.0), ("b", 100.0)], True)
+        self.assertEqual(svg.count('class="bar"'), 2)  # one hue; the status is in the table, with its icon
         self.assertIn("Scale 90% to 100% (zoomed)", svg)
-        self.assertIn("Scale 0% to 100%", report._chart({"title": "t", "zoom": False, "points": [("a", 5.0, "green")]}))
+        self.assertIn("Scale 0% to 100%", layout.bars("t", [("a", 5.0)], False))
 
 
 THRESHOLDS = {"packetLoss": {"goodLimit": 0.1, "okLimit": 1.0}, "latency": {"goodLimit": 20.0, "okLimit": 50.0},
@@ -842,6 +841,35 @@ class CompleteResultsTests(unittest.TestCase):
         m = report.compute(bundle(**{"overlay:1.NE": overlay}))
         self.assertEqual(m["metrics"]["overlay_avail_pct"]["value"], 100.0)
         self.assertEqual(report.DEFAULT_OPTIONS["down_tunnels"], "separate")
+
+
+class LayoutTests(unittest.TestCase):
+    """The fixed page layout (docs/report-layout.md)."""
+
+    def test_page_frame_order_and_status_with_icon_and_word(self):
+        page = report.render(report.compute(bundle()))
+        marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
+                 'data-section-id="avail-summary"', "<footer>"]
+        self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
+        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # the title is the message
+        self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
+        self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
+
+    def test_long_tables_move_whole_to_the_appendix(self):
+        many = [{"nePk": "{}.NE".format(i), "hostName": "s{}".format(i), "state": 1} for i in range(60)]
+        data = {"appliances": many}
+        data.update({"reach:{}.NE".format(i): [{"samplecount": 100, "appliancereachability": 100 - i % 3}] for i in range(60)})
+        page = report.render(report.compute(bundle(**data)))
+        self.assertIn('<a href="#appendix-avail-appliances">full table in the appendix</a>', page)
+        appendix = page[page.index('id="appendix-avail-appliances"'):]
+        self.assertEqual(appendix.count("<tr>") - 1, 60)  # every row, header row aside
+
+    def test_noc_health_is_a_status_grid_per_category(self):
+        hours = HealthByCategoryTests.hours
+        data = {"health:" + cat: {"1.NE": hours("HEALTHY" if cat != "MOS" else "MAJOR")} for cat in ("LOSS", "MOS")}
+        page = report.render(report.compute(phase2_bundle("noc", **data)))
+        self.assertIn("branch-a \u00b7 MOS: 0% (Critical)", page)
+        self.assertIn("branch-a \u00b7 loss: 100% (Good)", page)
 
 
 class HealthByCategoryTests(unittest.TestCase):
