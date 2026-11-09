@@ -1936,7 +1936,7 @@ def _figure(sid: str, sec: Mapping[str, Any]) -> str:
     return ""
 
 
-def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = None) -> str:
+def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = None, theme: str = "auto") -> str:
     """One self-contained page in the fixed layout (layout.py): no scripts, no external links, prints on A4."""
     if narrative is not None:
         problems = validate(metrics, narrative)
@@ -1985,7 +1985,7 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
                                                                        metrics.get("bundle_sha256"), __version__)),
               ("Status", "Good, Warning, Critical and No data, each shown with an icon as well as a colour. Times are UTC.")]
     return layout.page("{}, {}: {}".format(TITLES[name], period, message), "EdgeConnect \u00b7 " + TITLES[name], facts, options, overall, verdict, banner, index,
-                       layout.tiles([shown(m) for m in kpis]), "\n".join(parts), appendix, footer)
+                       layout.tiles([shown(m) for m in kpis]), "\n".join(parts), appendix, footer, theme)
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -2043,6 +2043,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     q.add_argument("metrics", type=Path)
     q.add_argument("narrative", type=Path, nargs="?")
     q.add_argument("--out", type=Path, required=True)
+    q.add_argument("--theme", choices=layout.THEMES, default="auto", help="light, dark, or auto (default: follows the reader's system setting)")
     args = parser.parse_args(argv)
     try:
         if args.command in ("collect", "store"):
@@ -2088,7 +2089,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
             print("narrative is valid")
         elif args.command == "render":
-            args.out.write_text(render(_load(args.metrics), _load(args.narrative) if args.narrative else None), encoding="utf-8")
+            args.out.write_text(render(_load(args.metrics), _load(args.narrative) if args.narrative else None, args.theme), encoding="utf-8")
             print("wrote {}".format(args.out))
     except (ValueError, KeyError, OSError, EdgeConnectError, ToolError) as exc:
         print("edgeconnect-mcp report: {}".format(exc), file=sys.stderr)

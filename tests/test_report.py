@@ -1189,6 +1189,13 @@ class LayoutGapTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             layout.line("x", series * 2, "%")
 
+    def test_series_with_different_hours_share_one_time_axis(self):
+        svg = layout.line("t", [("a", [("01", 1.0), ("03", 1.0)]), ("b", [("02", 2.0), ("03", 2.0)])], "%")
+        xs = [[p.split(",")[0] for p in m.split()] for m in re.findall(r'points="([^"]+)"', svg)]
+        self.assertEqual(xs[0][1], xs[1][1])  # both "03" points sit at the same x
+        self.assertNotEqual(xs[0][0], xs[1][0])  # "01" and "02" do not
+        self.assertEqual(layout.line("t", [("one", [("01", 5.0)])], "%").count("<circle"), 1)  # a single point is still drawn
+
     def test_next_links_and_number_formats(self):
         page = report.render(report.compute(bundle()))
         self.assertIn('<nav class="next"', page)
@@ -1304,6 +1311,24 @@ class SnapshotTests(unittest.TestCase):
     def test_noc_page(self):
         data = {"health:" + c: {"1.NE": HealthByCategoryTests.hours("MAJOR" if c == "MOS" else "HEALTHY")} for c in ("LOSS", "MOS")}
         self.check("noc", report.render(report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "MAJOR", "description": "d"}], **data))))
+
+
+class ThemeTests(unittest.TestCase):
+    """Light, dark or the reader's system setting; long unbroken text never widens the page on a phone."""
+
+    def test_theme_is_light_dark_or_auto(self):
+        m = report.compute(bundle())
+        self.assertIn('<html lang="en" data-theme="light">', report.render(m, theme="light"))
+        self.assertIn('<html lang="en" data-theme="dark">', report.render(m, theme="dark"))
+        self.assertIn('<html lang="en">', report.render(m))  # auto: follows the reader's system
+        self.assertIn(':root[data-theme="dark"]{', report.render(m))
+        with self.assertRaises(ValueError):
+            report.render(m, theme="blue")
+
+    def test_long_unbroken_text_wraps(self):
+        self.assertIn("overflow-wrap:anywhere", layout.CSS.split("footer{")[1].split("}")[0])
+        self.assertIn("svg.chart{min-width:640px}", layout.CSS)  # charts keep readable text on a phone and scroll inside their figure
+        self.assertIn("figure{margin:8px 0;overflow-x:auto}", layout.CSS)
 
 
 class HealthByCategoryTests(unittest.TestCase):
