@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # Report statuses (green/amber/red/grey) -> the fixed notation: class, icon, word. Status is never shown by colour alone.
 STATUS = {"green": ("good", "✓", "Good"), "amber": ("warning", "!", "Warning"), "red": ("critical", "✕", "Critical"), "grey": ("nodata", "–", "No data")}
 THEMES = ("auto", "light", "dark")  # auto follows the reader's system setting; print is always light
-APPENDIX_ROWS = 50  # longer tables move, whole, to the appendix; no row is ever dropped
+APPENDIX_ROWS = 50
+SHOWN_ROWS = 15  # a long table shows its first (worst or largest) rows in place; every row is in the appendix  # longer tables move, whole, to the appendix; no row is ever dropped
 MAX_TILES = 6
 
 CSS = """
@@ -48,7 +49,7 @@ svg .icon{fill:#fff;font-size:12px;font-weight:700}svg .icon.warning,svg .icon.n
 details.tbl summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:6px}
 .tablewrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12.5px;margin:6px 0}th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--grid);vertical-align:top}
 th{color:var(--ink2);font-weight:600}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.notes h3,.appendix h3,footer h3{font-size:12.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);margin:10px 0 4px}.notes ul{margin:0;padding-left:18px}
+h3.apart,.notes h3,.appendix h3,footer h3{font-size:12.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink2);margin:10px 0 4px}.notes ul{margin:0;padding-left:18px}
 .appendix h2,footer h2{font-size:17px}
 footer{font-size:12.5px;color:var(--ink2);border-top:2px solid var(--ink);margin-top:24px;padding-top:12px;overflow-wrap:anywhere}
 .summary,.notes li,.options,.verdict p{overflow-wrap:anywhere}footer p{margin:4px 0}
@@ -190,10 +191,33 @@ def human_bytes(n: float) -> str:
     return "{:.0f} bytes".format(n)
 
 
+HEADERS = {"nePk": "nePk", "wan_bytes": "WAN traffic", "lan_bytes": "LAN traffic", "saved_bytes": "Saved", "bytes": "Traffic", "mos": "MOS",
+           "pre_fec_loss_pct": "Loss before FEC %", "p95_out_pct": "P95 out %", "p95_in_pct": "P95 in %", "avg_out_pct": "Average out %",
+           "avg_in_pct": "Average in %", "avg_change_pts": "Change in average (points)", "dscp": "DSCP", "qos_drops": "QoS drops",
+           "source_ip": "Source IP", "bw_utilization": "Utilisation", "alarm": "Alarm", "nepk": "nePk"}
+
+
+def header(column: str) -> str:
+    """Column name in words with its unit: loss_pct -> "Loss %", latency_ms -> "Latency (ms)"."""
+    if column in HEADERS:
+        return HEADERS[column]
+    words = column
+    for suffix, unit in (("_pct", " %"), ("_ms", " (ms)"), ("_mbps", " (Mbps)"), ("_utc", " (UTC)"), ("_min", " (minutes)"), ("_bytes", "")):
+        if words.endswith(suffix):
+            words = words[:-len(suffix)] + unit
+            break
+    words = words.replace("_", " ").strip()
+    return words[:1].upper() + words[1:]
+
+
 def number(column: str, value: float) -> str:
-    """Fixed formats: availability and reachability to 3 decimals, other percentages to 1, everything else 2."""
+    """Fixed formats: availability 3 decimals, loss and MOS 2, milliseconds whole, other percentages 1, everything else 2."""
     if any(k in column for k in ("avail", "reach")):
         return "{:,.3f}".format(value)
+    if "loss" in column or column == "mos":
+        return "{:,.2f}".format(value)
+    if column.endswith("_ms"):
+        return "{:,.0f}".format(value)
     return "{:,.1f}".format(value) if column.endswith("_pct") else "{:,.2f}".format(value)
 
 
@@ -214,9 +238,10 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
     if not rows:
         return ""
     columns = list(rows[0].keys())
-    numeric = {c for c in columns if all(isinstance(r.get(c), (int, float)) and not isinstance(r.get(c), bool) for r in rows if r.get(c) is not None)
-               and any(r.get(c) is not None for r in rows)}
-    head = "".join('<th class="{}">{}</th>'.format("n" if c in numeric else "", esc(c.replace("_", " "))) for c in columns)
+    plain = lambda v: v.get("value") if isinstance(v, dict) else v  # a cell may be {"value": .., "status": ..}, shown with its status icon
+    numeric = {c for c in columns if all(isinstance(plain(r.get(c)), (int, float)) and not isinstance(plain(r.get(c)), bool) for r in rows if plain(r.get(c)) is not None)
+               and any(plain(r.get(c)) is not None for r in rows)}
+    head = "".join('<th class="{}">{}</th>'.format("n" if c in numeric else "", esc(header(c))) for c in columns)
     body = []
     for r in rows:
         tds = []
@@ -224,29 +249,45 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
             if c == "status":
                 tds.append("<td>{}</td>".format(pill(r.get(c))))
                 continue
-            v = r.get(c)
+            v = plain(r.get(c))
             text = human_bytes(v) if c.endswith("bytes") and c in numeric and v is not None else number(c, v) if isinstance(v, float) else cell(v)[0]
+            if isinstance(r.get(c), dict):
+                text = r[c].get("text") or text
+                cls, icon, _ = status_of(r[c].get("status"))
+                tds.append('<td class="{}"><span class="pill {}"><span aria-hidden="true">{}</span> {}</span></td>'.format("n" if c in numeric else "", cls, icon, esc(text)))
+                continue
             tds.append('<td class="{}">{}</td>'.format("n" if c in numeric else "", esc(text)))
         body.append("<tr>{}</tr>".format("".join(tds)))
     return '<div class="tablewrap"><table><thead><tr>{}</tr></thead><tbody>{}</tbody></table></div>'.format(head, "".join(body))
 
 
 def section(sid: str, number: int, title: str, status: str, summary: str, figure: str, stat_html: str, rows: Sequence[Mapping[str, Any]],
-            notes: Sequence[str], appendix: List[str], causes: Sequence[str] = (), actions: Sequence[str] = (), follow: Sequence[str] = ()) -> str:
+            notes: Sequence[str], appendix: List[str], causes: Sequence[str] = (), actions: Sequence[str] = (), follow: Sequence[str] = (),
+            apart: Optional[Mapping[str, Any]] = None, key_points: Sequence[str] = ()) -> str:
     """One section, always the same anatomy: number, title, status; summary; figures; table view; notes; possible causes; actions."""
     view = ""
     if rows:
         if len(rows) > APPENDIX_ROWS:
             appendix.append('<section class="appendix" id="appendix-{0}" data-section-id="appendix-{0}"><h2>Appendix: {1}</h2><p>All {2:,} rows.</p>{3}</section>'.format(
                 esc(sid), esc(title), len(rows), table(rows)))
-            view = '<p class="options">{:,} rows: <a href="#appendix-{}">full table in the appendix</a>.</p>'.format(len(rows), esc(sid))
+            view = '<details class="tbl" open><summary>Table</summary>{}</details><p class="options">{} {} of {:,} shown; <a href="#appendix-{}">all {:,} rows in the appendix</a>.</p>'.format(
+                table(rows[:SHOWN_ROWS]), "Worst" if "status" in rows[0] or any(isinstance(v, dict) for v in rows[0].values()) else "Top", SHOWN_ROWS, len(rows), esc(sid), len(rows))
         else:
             view = '<details class="tbl" open><summary>Table ({} row{})</summary>{}</details>'.format(len(rows), "" if len(rows) == 1 else "s", table(rows))
+    if apart and apart.get("rows"):  # things set aside (idle tunnels, unused ports): a table at the end, never a paragraph of names
+        rows_apart, label = apart["rows"], "{} ({:,})".format(apart["title"], len(apart["rows"]))
+        if len(rows_apart) > APPENDIX_ROWS:
+            appendix.append('<section class="appendix" id="appendix-{0}-apart" data-section-id="appendix-{0}-apart"><h2>Appendix: {1}</h2>{2}</section>'.format(
+                esc(sid), esc(label), table(rows_apart)))
+            view += '<h3 class="apart">{}</h3><p class="options"><a href="#appendix-{}-apart">Full list in the appendix</a>.</p>'.format(esc(label), esc(sid))
+        else:
+            view += '<h3 class="apart">{}</h3><details class="tbl" open><summary>Table ({} rows)</summary>{}</details>'.format(esc(label), len(rows_apart), table(rows_apart))
+    key = '<div class="notes key"><h3>Key points</h3><ul>{}</ul></div>'.format("".join("<li>{}</li>".format(esc(k)) for k in key_points)) if key_points else ""
     lists = (("Notes", notes), ("Possible causes", causes), ("Recommended actions", actions))
     note_html = "".join('<div class="notes"><h3>{}</h3><ul>{}</ul></div>'.format(h, "".join("<li>{}</li>".format(esc(i)) for i in items)) for h, items in lists if items)
     return ('<section id="{0}" data-section-id="{0}" aria-labelledby="{0}-h"><header class="sec-head"><span class="num">{1}</span><h2 id="{0}-h">{2}</h2>{3}</header>'
-            '{4}{5}{6}{7}{8}{9}</section>').format(esc(sid), number, esc(title), pill(status), summary, stat_html, figure, view, note_html,
-                                                   '<nav class="next" aria-label="Follow-up reports">Next: {}</nav>'.format(" \u00b7 ".join(esc(f) for f in follow)) if follow else "")
+            '{4}{10}{5}{6}{7}{8}{9}</section>').format(esc(sid), number, esc(title), pill(status), summary, stat_html, figure, view, note_html,
+                                                   '<nav class="next" aria-label="Follow-up reports">Next: {}</nav>'.format(" \u00b7 ".join(esc(f) for f in follow)) if follow else "", key)
 
 
 def page(title: str, kind: str, facts: Sequence[Tuple[str, str]], options: str, verdict_status: str, verdict_text: str, banner: str,
