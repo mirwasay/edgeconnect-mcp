@@ -158,6 +158,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
     peak = max([v for _, pts in series for _, v in pts] + ([threshold] if threshold is not None else []) + [0.0])
     step = 10 ** max(0, len("{:.0f}".format(peak)) - 1) / 2 or 1.0
     top = max(step, -(-peak * 1.1 // step) * step)
+    if unit == "%" and peak <= 100:
+        top = min(top, 100.0)  # a share never goes past 100
     sx = lambda i: x0 + (i * (x1 - x0) / (len(labels) - 1) if len(labels) > 1 else (x1 - x0) / 2)
     sy = lambda v: y0 - v / top * (y0 - y1)
     parts = []
