@@ -30,7 +30,7 @@ from .errors import EdgeConnectError
 from .server import HOME_DOTENV, Server, ToolError
 
 STATUSES = ("green", "amber", "red", "grey")
-REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths")
+REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations")
 SECTIONS = {
     "availability": (("avail-summary", "Availability summary"), ("avail-appliances", "Appliance reachability"),
                      ("avail-tunnels", "Tunnel availability"), ("avail-paths", "Path quality"), ("avail-alarms", "Alarms in the period"), ("data-gaps", "Data gaps")),
@@ -41,7 +41,10 @@ SECTIONS = {
                   ("life-backups", "Backups"), ("life-advisories", "Security advisories"), ("life-eol", "Hardware end of life"), ("data-gaps", "Data gaps")),
     "executive": (("exec-fleet", "Fleet"), ("exec-availability", "Availability"), ("exec-alarms", "Active alarms"),
                   ("exec-licensing", "Licensing"), ("exec-software", "Software versions"), ("exec-capacity", "WAN capacity"),
-                  ("exec-noc", "NOC digest"), ("exec-lifecycle", "Lifecycle and vulnerabilities"), ("data-gaps", "Data gaps")),
+                  ("exec-noc", "NOC digest"), ("exec-paths", "Path quality"), ("exec-traffic", "WAN traffic"), ("exec-lifecycle", "Lifecycle and vulnerabilities"),
+                  ("exec-actions", "Recommended actions"), ("data-gaps", "Data gaps")),
+    "operations": (("ops-state", "Appliance state"), ("ops-alarms", "Active alarms"), ("ops-health", "Health by category"), ("ops-tunnels", "Tunnels down"),
+                   ("ops-paths", "Worst paths"), ("ops-capacity", "Busiest WAN links"), ("ops-actions", "Recommended actions"), ("data-gaps", "Data gaps")),
     "traffic": (("traffic-summary", "Traffic summary"), ("traffic-apps", "Applications"), ("traffic-talkers", "Top talkers"), ("traffic-domains", "Domains"),
                 ("traffic-countries", "Countries"), ("traffic-ports", "Ports"), ("traffic-classes", "Traffic classes"), ("data-gaps", "Data gaps")),
     "paths": (("paths-summary", "Path quality summary"), ("paths-ranked", "Every active path, worst first"), ("paths-fec", "Loss hidden by FEC"),
@@ -53,15 +56,14 @@ ALWAYS_DOWN = 0.99  # a tunnel group up less than 1% of the period counts as dow
 TITLES = {"availability": "Availability report", "noc": "NOC digest", "capacity": "WAN capacity report",
           "lifecycle": "Lifecycle, licence and vulnerability report", "incident": "Major incident report",
           "executive": "Executive summary", "traffic": "Traffic and applications report",
-          "paths": "Path quality report"}
+          "paths": "Path quality report", "operations": "Operations summary"}
 INCIDENT_LOOKBACK_MS = 24 * 3600000  # changes in the 24 hours before an incident are shown next to it
 INCIDENT_MAX_APPLIANCES = 20
 INCIDENT_MAX_MS = 7 * 86400000  # longer windows are periods, not incidents (and the minute reachability is read per day)
 AUDIT_PAGE = 10000  # GET /action returns at most this many entries, newest first
 # The executive page's KPI strip: availability, overlays, sites below target, critical alarms, licence, capacity, NOC, advisories.
-EXEC_KPIS = ("fleet_reach_pct", "overlay_avail_pct", "appliances_below_target", "active_critical", "license_days_left", "worst_p95_pct",
-             "sites_needing_attention", "advisory_hits")
-PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle")}  # reports that combine others; the rest are themselves
+EXEC_KPIS = ("fleet_reach_pct", "paths_ok_pct", "wan_bytes_total", "worst_p95_pct", "active_critical", "license_days_left")
+PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle", "traffic", "paths"), "operations": ("noc", "paths", "capacity")}  # reports that combine others; the rest are themselves
 STATE_NAMES = {1: "normal", 2: "unreachable", 3: "unsupported", 4: "out of sync", 5: "syncing"}  # GET /appliance `state`
 GOOD_HEALTH = ("HEALTHY",)  # POST /health hourly `status` that counts as good; the spec enum is HEALTHY, WARNING, MINOR, MAJOR, CRITICAL
 WAN_INTERFACE = re.compile(r"^b?wan\d", re.I)  # WAN ports and their VLANs (wan0, wan1.20, bwan0) in POST /stats/aggregate/interface
@@ -73,7 +75,7 @@ DEFAULT_OPTIONS = {"period": "last-month", "scope": "all", "target": "orchestrat
 SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
 MAX_ALARMS = 10000
 WINDOW_PERIODS = {"last-24-hours": 86400, "last-7-days": 7 * 86400}  # rolling windows ending now, for reports that read stats aggregates
-DEFAULT_PERIOD = {"traffic": "last-7-days", "paths": "last-7-days"}  # every other report defaults to DEFAULT_OPTIONS["period"]
+DEFAULT_PERIOD = {"traffic": "last-7-days", "paths": "last-7-days", "operations": "last-7-days"}  # every other report defaults to DEFAULT_OPTIONS["period"]
 TRAFFIC_TOP = 100000  # `top` sent so the Orchestrator returns every application, domain and port, not its default ten
 TALKERS_CAP = 100  # GET /stats/aggregate/topTalkers returns at most 100 per appliance whatever `top` asks (seteam, 10.0, 2026-11-08)
 TRAFFIC_PATHS = ("/stats/aggregate/application2", "/stats/aggregate/topTalkers", "/stats/aggregate/dns", "/stats/aggregate/ports", "/stats/aggregate/trafficClass")
@@ -99,7 +101,9 @@ CARDS: Dict[str, Any] = json.loads((Path(__file__).with_name("cards.json")).read
 EXEC_SOURCES = {"exec-availability": ("avail-appliances", "avail-tunnels", "avail-paths"), "exec-alarms": ("noc-alarms",), "exec-licensing": ("life-licences",),
                 "exec-software": ("life-inventory",), "exec-capacity": ("cap-links",), "exec-noc": ("noc-appliances", "noc-health", "noc-tunnels"),
                 "exec-lifecycle": ("life-backups", "life-advisories"),
-                "paths-ranked": ("avail-paths",), "paths-summary": ("avail-paths",)}
+                "paths-ranked": ("avail-paths",), "paths-summary": ("avail-paths",), "exec-paths": ("avail-paths", "paths-fec"),
+                "ops-state": ("noc-appliances",), "ops-alarms": ("noc-alarms",), "ops-health": ("noc-health",), "ops-tunnels": ("noc-tunnels",),
+                "ops-paths": ("avail-paths",), "ops-capacity": ("cap-links",)}
 _OPS = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
 # Figures written as words are figures too.
 _NUMBER_WORDS = re.compile(r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
@@ -201,7 +205,7 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
     period = period or DEFAULT_PERIOD.get(report, DEFAULT_OPTIONS["period"])
     options = {"period": "month" if month else period, "scope": "all", "target": target, "down_tunnels": down_tunnels}
     if period in WINDOW_PERIODS and not month:
-        if report not in ("traffic", "paths", "noc", "lifecycle"):
+        if report not in ("traffic", "paths", "operations", "noc", "lifecycle"):
             raise ValueError("--period {} is for the traffic report; {} takes a month (last-month, month-to-date or --month)".format(period, report))
         end_ms = int(now.timestamp()) // 3600 * 3600 * 1000  # whole hours, so the previous window lines up
         start_ms, first = end_ms - WINDOW_PERIODS[period] * 1000, None
@@ -238,7 +242,8 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
         # Hourly buckets are kept about 14 days (GET /gms/stats/retention); older windows use daily ones.
         granularity = "hour" if start_ms >= int(now.timestamp() * 1000) - 14 * 86400000 else "day"
         for ne in nepks:
-            c.call("paths:" + ne, "/stats/aggregate/tunnel", {"nePk": ne, "startTime": start_ms // 1000, "endTime": end_ms // 1000, "granularity": granularity})
+            if "paths:" + ne not in c.data:  # the availability part already read the same window
+                c.call("paths:" + ne, "/stats/aggregate/tunnel", {"nePk": ne, "startTime": start_ms // 1000, "endTime": end_ms // 1000, "granularity": granularity})
     now_ms = int(now.timestamp() * 1000)
     c.data["read_posts"] = c.read_posts
     if "incident" in parts:
@@ -611,6 +616,7 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     options = dict(DEFAULT_OPTIONS, month=bundle["period"]["month"])
     options.update(bundle.get("options") or {})
     ctx = {"data": data, "inventory": inventory, "names": names, "metric": metric, "metrics": metrics, "gaps": gaps, "stats_down": stats_down, "now_s": now_s, "options": options,
+           "period_from_s": bundle["period"]["from_ms"] // 1000,
            "period_s": max(1, (bundle["period"]["to_ms"] - bundle["period"]["from_ms"]) // 1000)}
     m_total = metric("appliances_total", len(inventory), "appliances", "Appliances in scope")
     if "availability" in parts:
@@ -645,20 +651,35 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
         sections["exec-capacity"] = {"status": sections["cap-summary"]["status"], "metrics": sections["cap-summary"]["metrics"]}
         sections["exec-noc"] = {"status": sections["noc-summary"]["status"], "metrics": sections["noc-summary"]["metrics"]}
         sections["exec-lifecycle"] = {"status": sections["life-summary"]["status"], "metrics": sections["life-summary"]["metrics"]}
+        sections["exec-paths"] = {"status": sections["paths-summary"]["status"], "metrics": ["paths_ok_pct", "paths_red", "paths_fec_masking"],
+                                  "notes": ["Rule: at least 98% of paths within every health threshold is green, 90% amber."]}
+        sections["exec-traffic"] = {"status": sections["traffic-summary"]["status"], "metrics": ["wan_bytes_total", "wan_bytes_change_pct", "top_app_share_pct"],
+                                    "chart": sections["traffic-apps"].get("chart")}
+    if report == "operations":
+        for sid, source in (("ops-state", "noc-appliances"), ("ops-alarms", "noc-alarms"), ("ops-health", "noc-health"), ("ops-tunnels", "noc-tunnels"),
+                            ("ops-paths", "paths-ranked"), ("ops-capacity", "cap-links")):
+            sections[sid] = dict(sections[source])
     kept = day_retention(data.get("retention"), ("tunnel", "interface"))
     if kept and bundle["period"]["from_ms"] // 1000 < now_s - kept and report in ("availability", "capacity", "executive"):
         gaps.append("The period starts older than the {:g} days of daily statistics this Orchestrator keeps, so path quality and capacity cover only part of it, or none.".format(kept / 86400))
     for sid, sec in sections.items():  # possible causes and actions: only card entries whose conditions hold
         sources = EXEC_SOURCES.get(sid, (sid,))
         sec["causes"], sec["actions"] = _eligible(sources, metrics, "causes"), _eligible(sources, metrics, "actions")
+    for sid in ("exec-actions", "ops-actions"):  # one list of every action the summary's sections show, in section order
+        if sid in dict(SECTIONS[report]):
+            listed = [a for other, _ in SECTIONS[report] if other in sections for a in sections[other].get("actions", [])]
+            unique = list({a["id"]: a for a in listed}.values())
+            sections[sid] = {"status": "amber" if unique else "green", "metrics": [], "actions": unique, "causes": [],
+                             "notes": [] if unique else ["No action needed from this period's data."]}
     sections["data-gaps"] = {"status": "grey" if gaps else "green", "metrics": [], "notes": gaps or ["None: every call returned data."]}
     headline = None
-    if report == "executive":
-        areas = [sid for sid, _ in SECTIONS[report] if sid != "data-gaps"]
+    if report in ("executive", "operations"):
+        areas = [sid for sid, _ in SECTIONS[report] if sid not in ("data-gaps", "exec-actions", "ops-actions")]
         overall = worst([sections[sid]["status"] for sid in areas])
         attention = [dict(SECTIONS[report])[sid] for sid in areas if sections[sid]["status"] in ("amber", "red")]
-        headline = {"status": overall, "kpis": [k for k in EXEC_KPIS if k in metrics],
-                    "text": "Overall: {}. {}.".format(overall.title(), "No area needs attention" if not attention else "Attention needed in " + ", ".join(attention))}
+        kpis = EXEC_KPIS if report == "executive" else ("state_unreachable", "active_critical", "health_good_24h_pct", "tunnels_bonded_down", "paths_ok_pct", "worst_p95_pct")
+        headline = {"status": overall, "kpis": [k for k in kpis if k in metrics],
+                    "text": "Overall: {}. {}.".format(layout.STATUS[overall][2], "No area needs attention" if not attention else "Attention needed in " + ", ".join(attention))}
 
     # An appliance counts as covered when any per-appliance read returned something for it (keyed "<what>:<nePk>", or named inside a result).
     other = json.dumps({k: v for k, v in data.items() if k not in ("appliances", "versions") and ":" not in k})
@@ -872,13 +893,15 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                "median_latency_ms": round(statistics.median(t["latency"]), 1) if t["latency"] else None} for t in transports.values()]
     t_rows.sort(key=lambda r: (-r["outside_thresholds"], -r["between_thresholds"], r["transport"]))
     grey = "grey" if not rows else None
+    ok = sum(r["status"] == "green" for r in rows)
+    metric("paths_ok_pct", _pct(ok, len(rows)), "%", "Paths within every health threshold", "grey" if not rows else band(_pct(ok, len(rows)), (90.0, 98.0)))
     sections = {"paths-ranked": ranked,
                 "paths-fec": {"status": grey or ("amber" if masked else "green"), "metrics": [m_masked], "table": masked,
                               "notes": ["A path is listed when loss before FEC is at or above {:g}% and loss after FEC is at or below {:g}% (the packet loss health limits).".format(max(loss), min(loss))]},
                 "paths-transport": {"status": grey or worst(["red" if r["outside_thresholds"] else "amber" if r["between_thresholds"] else "green" for r in t_rows]) if t_rows else "grey",
                                     "metrics": [], "table": t_rows, "notes": ["Underlay paths only, grouped by the transport labels at the end of the tunnel name; medians across the paths."]}}
     sections["paths-summary"] = {"status": worst([ranked["status"], sections["paths-fec"]["status"]]),
-                                 "metrics": [m for m in ("paths_measured", "paths_red", "paths_amber", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
+                                 "metrics": [m for m in ("paths_ok_pct", "paths_measured", "paths_red", "paths_amber", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
     return sections
 
 
@@ -1196,6 +1219,7 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     apps: Dict[str, int] = {}
     total = previous = 0
     read_now = read_before = False
+    stamps: List[float] = []
     for ne in names:
         for key, is_now in (("apps:", True), ("apps_previous:", False)):
             rows = data.get(key + str(ne))
@@ -1205,19 +1229,30 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 n = _wan(row, "SUM_WTX_BYTES", "SUM_WRX_BYTES")
                 if row.get("APPNAME") == "__total__":
                     total, previous = (total + n, previous) if is_now else (total, previous + n)
+                    if is_now:
+                        stamps += [float(row[k]) for k in ("MIN_TIMESTAMP", "MAX_TIMESTAMP") if isinstance(row.get(k), (int, float))]
                 elif is_now:
                     apps[str(row.get("APPNAME"))] = apps.get(str(row.get("APPNAME")), 0) + n
             read_now, read_before = read_now or is_now, read_before or not is_now
     app_rows = _shares(apps, "application")
     for r in app_rows:  # share of all WAN traffic (the __total__ rows), not of the named applications only
         r["share_pct"] = round(100.0 * r["wan_bytes"] / total, 2) if total else None
-    change = round(100.0 * (total - previous) / previous, 2) if read_before and previous else None
+    # Application stats are hourly only and kept about 14 days (GET /gms/stats/retention "flowapp"): an older period is only partly there.
+    start_s, end_s = ctx["period_from_s"], ctx["period_from_s"] + ctx["period_s"]
+    covered = round((max(stamps) + 3600 - min(stamps)) / 86400, 1) if stamps else None
+    partial = bool(stamps) and min(stamps) > start_s + 86400
+    if partial:
+        ctx["gaps"].append("Traffic: application data covers only {} to {} UTC of the period; the Orchestrator keeps hourly application statistics for about 14 days, "
+                           "so the totals are for that part only and are not compared with the period before.".format(
+                               datetime.fromtimestamp(min(stamps), timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(min(max(stamps), end_s), timezone.utc).strftime("%Y-%m-%d")))
+    change = round(100.0 * (total - previous) / previous, 2) if read_before and previous and not partial else None
     status = "green" if read_now else "grey"
     sections: Dict[str, Dict[str, Any]] = {}
     m_total = metric("wan_bytes_total", total if read_now else None, "bytes", "WAN traffic, sent and received")
     m_change = metric("wan_bytes_change_pct", change, "%", "Change against the previous period of the same length")
     m_top = metric("top_app_share_pct", app_rows[0]["share_pct"] if app_rows else None, "%", "Largest application's share of WAN traffic")
     m_apps = metric("applications_seen", len(app_rows), "applications", "Applications with traffic")
+    m_days = metric("traffic_days_covered", covered, "days", "Days of the period with application data")
     sections["traffic-apps"] = {"status": status, "metrics": [m_apps, m_top], "table": app_rows,
                                 "chart": {"title": "Share of WAN traffic by application, % (largest 15)", "zoom": False,
                                           "points": [(r["application"], r["share_pct"]) for r in app_rows[:15] if r["share_pct"] is not None]}}
@@ -1265,7 +1300,7 @@ def _traffic(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         walk(data.get("classes:" + str(ne)))
     rows = _shares(classes, "traffic_class")
     sections["traffic-classes"] = {"status": "green" if rows else "grey", "metrics": [], "table": rows, "notes": ["Traffic classes as defined in the QoS (shaper) policy, all traffic types."]}
-    sections["traffic-summary"] = {"status": status, "metrics": [m_total, m_change, m_top, m_apps]}
+    sections["traffic-summary"] = {"status": status, "metrics": [m_total, m_change, m_top, m_apps, m_days]}
     if read_now and not read_before:
         ctx["gaps"].append("Traffic: the previous period could not be read, so the change is not shown.")
     return sections
