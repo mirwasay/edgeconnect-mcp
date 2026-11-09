@@ -385,7 +385,7 @@ class PresentationTests(unittest.TestCase):
         b["options"] = {"down_tunnels": "separate"}
         m = report.compute(b)
         self.assertEqual((m["metrics"]["overlay_avail_pct"]["value"], m["metrics"]["tunnel_groups_down_all_period"]["value"]), (100.0, 2))
-        self.assertIn("branch-a overlay INET SSE (2 tunnels)", " ".join(m["sections"]["avail-tunnels"]["notes"]))
+        self.assertEqual(m["sections"]["avail-tunnels"]["apart"]["rows"], [{"appliance": "branch-a", "kind": "Overlay", "label": "INET", "service": "SSE", "tunnels": 2}])
         self.assertIn("down tunnels: separate (2 down all period and 0 idle tunnels losing probes excluded)", report.render(m))
 
     def test_singular_units_status_coloured_bars_and_labelled_axis(self):
@@ -456,11 +456,11 @@ class ReviewFixTests(unittest.TestCase):
         b["options"] = {"down_tunnels": "separate"}
         m = report.compute(b)  # separate: listed apart and left out of the status
         self.assertNotIn("to_hub_GUEST", [r["tunnel"] for r in m["sections"]["avail-paths"]["table"]])
-        self.assertIn("listed apart", " ".join(m["sections"]["avail-paths"]["notes"]))
+        self.assertIn("listed at the end of this section", " ".join(m["sections"]["avail-paths"]["notes"]))
         self.assertIn("1 idle tunnels losing probes excluded", report.render(m))
         silent = {"tunnel_9": {"1.NE": {"alias": "to_hub_SPARE", "overlayid": "0", "SUM_POST_LOSS": 0, "SUM_WRX_PKTS": 0, "AVG_LATENCY_AVG": 5, "AVG_JITTER": 1, "mos": 440}}}
         row = report.compute(bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": silent}))["sections"]["avail-paths"]["table"][0]
-        self.assertEqual((row["loss_pct"], row["note"], row["status"]), (None, "", "green"))  # no packets and no probe loss: loss is no data
+        self.assertEqual((row["loss_pct"], row.get("note", ""), row["status"]), (None, "", "green"))  # no packets and no probe loss: loss is no data
         m = report.compute(bundle(**{"paths:1.NE": paths}))  # no thresholds read: defaults, listed as a gap
         self.assertIn("healthThresholdConfig", " ".join(m["sections"]["data-gaps"]["notes"]))
 
@@ -737,11 +737,11 @@ class ReviewRound3Tests(unittest.TestCase):
         hour = bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
         hour["period"].update(from_ms=0, to_ms=3600000)
         row = report.compute(hour)["sections"]["avail-paths"]["table"][0]
-        self.assertEqual((row["note"], row["loss_pct"]), ("", 0.02))  # 5,000 packets is plenty for an hour
+        self.assertEqual((row.get("note", ""), row["loss_pct"]), ("", 0.02))  # 5,000 packets is plenty for an hour
         month = bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
         month["period"].update(from_ms=0, to_ms=30 * 86400000)
         month["options"] = {"down_tunnels": "include"}
-        self.assertEqual(report.compute(month)["sections"]["avail-paths"]["table"][0]["note"], "no traffic, probes lost")
+        self.assertEqual(report.compute(month)["sections"]["avail-paths"]["table"][0].get("note"), "no traffic, probes lost")
 
     def test_last_months_alarms_without_an_archive_are_not_zero(self):
         b = bundle(appliance_alarms=[], period_alarms_covered=False)
@@ -863,7 +863,7 @@ class LayoutTests(unittest.TestCase):
         data = {"appliances": many}
         data.update({"reach:{}.NE".format(i): [{"samplecount": 100, "appliancereachability": 100 - i % 3}] for i in range(60)})
         page = report.render(report.compute(bundle(**data)))
-        self.assertIn('<a href="#appendix-avail-appliances">full table in the appendix</a>', page)
+        self.assertIn('<a href="#appendix-avail-appliances">all 60 rows in the appendix</a>', page)
         appendix = page[page.index('id="appendix-avail-appliances"'):]
         self.assertEqual(appendix.count("<tr>") - 1, 60)  # every row, header row aside
 
@@ -871,8 +871,8 @@ class LayoutTests(unittest.TestCase):
         hours = HealthByCategoryTests.hours
         data = {"health:" + cat: {"1.NE": hours("HEALTHY" if cat != "MOS" else "MAJOR")} for cat in ("LOSS", "MOS")}
         page = report.render(report.compute(phase2_bundle("noc", **data)))
-        self.assertIn("branch-a \u00b7 MOS: 0% (Critical)", page)
-        self.assertIn("branch-a \u00b7 loss: 100% (Good)", page)
+        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0%</span>', page)  # MOS, now a table cell (owner review 2026-11-09)
+        self.assertIn('<span class="pill good"><span aria-hidden="true">\u2713</span> 100%</span>', page)  # loss
 
 
 class CardTests(unittest.TestCase):
@@ -1200,7 +1200,7 @@ class LayoutGapTests(unittest.TestCase):
         page = report.render(report.compute(bundle()))
         self.assertIn('<nav class="next"', page)
         self.assertIn("<td class=\"n\">99.500</td>", page)  # availability to 3 decimals
-        self.assertEqual(layout.table([{"loss_pct": 1.23456}]).count("1.2<"), 1)  # other percentages to 1 decimal
+        self.assertEqual(layout.table([{"share_pct": 1.23456}]).count("1.2<"), 1)  # other percentages to 1 decimal (loss keeps 2)
 
 
 class NetworkHealthTests(unittest.TestCase):
@@ -1331,6 +1331,72 @@ class ThemeTests(unittest.TestCase):
         self.assertIn("figure{margin:8px 0;overflow-x:auto}", layout.CSS)
 
 
+class ReadabilityTests(unittest.TestCase):
+    """Owner review 2026-11-09: no paragraphs of names; tables with plain headers; health explained; key points as bullets."""
+
+    def test_paths_listed_apart_are_a_table_not_a_paragraph(self):
+        idle = {"t{}".format(i): {"1.NE": {"alias": "to_hub_{}".format(i), "overlayid": "1", "SUM_POST_LOSS": 50, "SUM_WRX_PKTS": 0, "AVG_LATENCY_AVG": 5, "AVG_JITTER": 1, "mos": 440}}
+                for i in range(3)}
+        b = phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": idle})
+        sec = report.compute(b)["sections"]["paths-ranked"]
+        self.assertEqual([r["tunnel"] for r in sec["apart"]["rows"]], ["to_hub_0", "to_hub_1", "to_hub_2"])
+        self.assertFalse(any("to_hub_0" in n for n in sec["notes"]))  # names are in the table, not in a note
+        page = report.render(report.compute(b))
+        self.assertIn('<h3 class="apart">Listed apart: tunnels with no traffic that lost probes (3)</h3>', page)
+
+    def test_headers_are_words_with_units(self):
+        html_table = layout.table([{"loss_pct": 0.123, "latency_ms": 30.4, "wan_bytes": 10, "pre_fec_loss_pct": 1.0, "mos": 4.38}])
+        for header in ("Loss %", "Latency (ms)", "WAN traffic", "Loss before FEC %", "MOS"):
+            self.assertIn(">{}<".format(header), html_table)
+        self.assertIn(">0.12<", html_table)  # loss to 2 decimals
+        self.assertIn(">30<", html_table)  # milliseconds whole
+
+    def test_health_is_a_table_that_explains_itself(self):
+        data = {"health:" + c: {"1.NE": HealthByCategoryTests.hours("MAJOR" if c == "MOS" else "HEALTHY")} for c in ("ALARM", "LOSS", "MOS")}
+        page = report.render(report.compute(phase2_bundle("noc", **data)))
+        sec = page[page.index('id="noc-health"'):page.index('id="noc-tunnels"')]
+        self.assertNotIn("<svg", sec)  # a table, not a grid
+        self.assertIn("% of the last 24 hours that category was rated healthy", sec)
+        self.assertIn("0% means it was never healthy", sec)
+        self.assertIn('<span class="pill critical"><span aria-hidden="true">\u2715</span> 0%</span>', sec)
+
+    def test_summary_sections_open_with_key_points(self):
+        page = report.render(report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}])))
+        sec = page[page.index('id="noc-summary"'):page.index('id="noc-appliances"')]
+        self.assertIn("<h3>Key points</h3>", sec)
+        self.assertIn("Active critical alarms: 1", sec)
+
+
+class ReadabilityRound2Tests(unittest.TestCase):
+    """Second pass on real seteam pages: long tables show their worst rows in place, health figures as a small table, a meaningful site list."""
+
+    def test_long_tables_show_the_worst_rows_in_place_and_all_in_the_appendix(self):
+        many = [{"nePk": "{}.NE".format(i), "hostName": "s{}".format(i), "state": 1} for i in range(60)]
+        data = {"appliances": many}
+        data.update({"reach:{}.NE".format(i): [{"samplecount": 100, "appliancereachability": 100 - i % 3}] for i in range(60)})
+        page = report.render(report.compute(bundle(**data)))
+        sec = page[page.index('id="avail-appliances"'):page.index('id="avail-roles"')]
+        self.assertEqual(sec.count("<tr>") - 1, layout.SHOWN_ROWS)
+        self.assertIn("Worst {} of 60 shown".format(layout.SHOWN_ROWS), sec)  # the table has a status column, so its order is worst first
+
+    def test_health_figures_are_one_small_table(self):
+        data = {"health:" + c: {"1.NE": HealthByCategoryTests.hours("MAJOR" if c == "MOS" else "HEALTHY")} for c in ("LOSS", "MOS")}
+        m = report.compute(phase2_bundle("noc", **data))
+        sec = m["sections"]["noc-health"]
+        self.assertEqual(sec["metrics"], ["health_good_24h_pct", "health_good_7d_pct"])
+        self.assertEqual([r["category"] for r in sec["chart"]["rows"]], ["Loss", "MOS"])
+
+    def test_sites_needing_attention_ignore_a_category_that_is_bad_everywhere(self):
+        data = {"health:" + c: {ne: HealthByCategoryTests.hours("MAJOR" if c == "MOS" else "HEALTHY") for ne in ("1.NE", "2.NE")} for c in ("LOSS", "LATENCY", "JITTER", "MOS")}
+        m = report.compute(phase2_bundle("noc", appliances=[dict(a, state=1) for a in APPLIANCES], **data))
+        self.assertEqual(m["sections"]["noc-worst"]["table"], [])  # MOS alone, everywhere: a setting, not two sites to visit
+
+    def test_summary_shows_key_points_instead_of_the_same_figures_twice(self):
+        page = report.render(report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}])))
+        sec = page[page.index('id="noc-summary"'):page.index('id="noc-appliances"')]
+        self.assertNotIn('class="stats"', sec)
+
+
 class HealthByCategoryTests(unittest.TestCase):
     """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
 
@@ -1348,7 +1414,7 @@ class HealthByCategoryTests(unittest.TestCase):
         notes = " ".join(m["sections"]["noc-health"]["notes"])
         self.assertIn("Only MOS is unhealthy", notes)
         row = m["sections"]["noc-health"]["table"][0]
-        self.assertEqual((row["appliance"], row["loss"], row["mos"]), ("branch-a", 100.0, 0.0))
+        self.assertEqual((row["appliance"], row["Loss"]["value"], row["MOS"]["value"], row["MOS"]["status"]), ("branch-a", 100.0, 0.0, "red"))
 
     def test_collect_reads_health_once_per_category(self):
         client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})

@@ -867,11 +867,12 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     tunnel_metrics.append(metric("tunnel_groups_down_all_period", sum(int(r["tunnels"] or 1) for r in always_down), "tunnels",
                                  "Tunnels down for the whole period ({})".format("left out of the figures" if separate else "included in the figures")))
     if always_down:
-        notes.append("Down for the whole period (up less than 1% of it), {}; often unused or decommissioned paths: ".format(
-                     "so left out of the figures above (option: down tunnels separate)" if separate else "and counted in the figures above (option: down tunnels include)")
-                     + "; ".join(" ".join([r["appliance"], r["kind"].lower()] + [str(x) for x in (r["label"], r["service"]) if x and x not in ("none", "unassigned")]
-                                          + ["({} tunnel{})".format(r["tunnels"], "" if r["tunnels"] == 1 else "s")]) for r in always_down) + ".")
-    sections["avail-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_metrics, "table": tunnel_rows, "notes": notes}
+        notes.append("Tunnels down for the whole period (up less than 1% of it) are usually unused or decommissioned paths; they are {} and listed at the end of this section.".format(
+                     "left out of the figures above" if separate else "counted in the figures above"))
+    apart = [{"appliance": r["appliance"], "kind": r["kind"], "label": "" if r["label"] in (None, "none") else r["label"],
+              "service": "" if r["service"] in (None, "none", "unassigned") else r["service"], "tunnels": r["tunnels"]} for r in always_down]
+    sections["avail-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_metrics, "table": tunnel_rows, "notes": notes,
+                                 "apart": {"title": "Listed apart: tunnel groups down for the whole period", "rows": apart}}
 
     # Alarms raised in the period: the full list if the read POST ran, otherwise per-appliance counts (GET).
     counts = {"CRITICAL": 0, "MAJOR": 0, "MINOR": 0, "WARNING": 0}
@@ -921,13 +922,13 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     below_if = sum(r["status"] in ("amber", "red") for r in if_rows)
     if_notes = ["Every interface with samples, lowest first (WAN, LAN and virtual)."]
     if unused:
-        if_notes.append("{} interfaces were up less than 1% of the period, usually unused or unplugged ports, {}: {}.".format(
-            len(unused), "listed here and left out of the table and status" if separate else "counted in the table and status",
-            "; ".join("{} {}".format(r["appliance"], r["interface"]) for r in unused)))
+        if_notes.append("Interfaces up less than 1% of the period are usually unused or unplugged ports; they are {} and listed at the end of this section.".format(
+            "left out of the table and status" if separate else "counted in the table and status"))
     sections["avail-interfaces"] = {"status": worst([r["status"] for r in if_rows]) if if_rows else "grey", "table": if_rows,
                                     "metrics": [metric("interfaces_below_target", below_if if if_rows else None, "interfaces", "Interfaces below the availability target"),
                                                 metric("interfaces_unused", len(unused), "interfaces", "Interfaces up less than 1% of the period")],
-                                    "notes": if_notes}
+                                    "notes": if_notes, "apart": {"title": "Listed apart: interfaces up less than 1% of the period",
+                                                                 "rows": [{k: r[k] for k in ("appliance", "interface", "label", "availability_pct")} for r in unused]}}
     # Hubs and branches: the same reachability minutes, grouped by the appliance's network role.
     role_of = {a.get("nePk"): ROLE_NAMES.get(str(a.get("networkRole")), "unknown role") for a in inventory if a.get("networkRole") is not None}
     by_role: Dict[str, List[float]] = {}
@@ -1020,9 +1021,13 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
              "Under {} packets received in the period a loss % means little, so a tunnel that lost probes there is shown as \"no traffic, probes lost\" and counted red: "
              "usually a broken path or a dead configuration.".format(floor)]
     if broken:
-        notes.append("{} tunnels with no traffic and lost probes are listed apart and left out of the status (option: down tunnels separate): {}{}.".format(
-            len(broken), "; ".join("{} {}".format(r["appliance"], r["tunnel"]) for r in broken), ""))
+        notes.append("Tunnels with no traffic that lost probes are left out of the status and listed at the end of this section.")
+    apart = [{"appliance": r["appliance"], "tunnel": r["tunnel"], "kind": r["kind"], "latency_ms": r["latency_ms"]} for r in broken]
+    if not any(r.get("note") for r in rows):  # the note column only when a row has one
+        for r in rows:
+            r.pop("note", None)
     return {"status": worst([r["status"] for r in rows]), "table": rows, "notes": notes,
+            "apart": {"title": "Listed apart: tunnels with no traffic that lost probes", "rows": apart},
             "metrics": [metric("paths_measured", len(rows), "tunnels", "Tunnels graded"),
                         metric("paths_red", red, "tunnels", "Tunnels outside the health thresholds", "red" if red else "green"),
                         metric("paths_amber", amber, "tunnels", "Tunnels between the health thresholds", "amber" if amber else "green"),
@@ -1459,15 +1464,35 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             health_ids += [metric("health_{}_good_{}_pct".format(key, w), shares[vertical][w]["all"], "%", "Appliance-hours with {} healthy, last {}".format(HEALTH_LABELS[vertical], w),
                                   band(shares[vertical][w]["all"], (95.0, 99.0))) for w in ("24h", "7d")]
         for ne, name in names.items():
-            table.append(dict({"appliance": name}, **{v.lower(): shares[v]["24h"]["by_ne"].get(ne) for v in per_category}))
-        table.sort(key=lambda r: min([x for k, x in r.items() if k != "appliance" and x is not None], default=101))
+            row: Dict[str, Any] = {"appliance": name}
+            for v in per_category:
+                pct = shares[v]["24h"]["by_ne"].get(ne)
+                row[_cap(HEALTH_LABELS[v])] = {"value": pct, "text": "no data" if pct is None else "{:.0f}%".format(pct), "status": band(pct, (95.0, 99.0))}
+            table.append(row)
+        table.sort(key=lambda r: (min([c["value"] for k, c in r.items() if k != "appliance" and c["value"] is not None], default=101), str(r["appliance"])))
         measured = {v: s["24h"]["all"] for v, s in shares.items() if s["24h"]["all"] is not None}
         bad = [v for v, pct in measured.items() if pct < 50]
         if len(bad) == 1 and len(measured) > 1 and all(pct >= 99 for v, pct in measured.items() if v not in bad):
             notes.append("Only {0} is unhealthy, in most hours, while every other category is healthy: check the {0} health thresholds (GET /health/healthThresholdConfig) "
                          "against the measured {0} values before treating this as a network problem.".format(HEALTH_LABELS[bad[0]]))
-        notes.append("Table: share of the last 24 hours each category was healthy, per appliance, worst first; blank means the category had no data.")
-    sections["noc-health"] = {"status": health_status, "metrics": health_ids, "table": table, "notes": notes}
+        notes += ["Each cell is the % of the last 24 hours that category was rated healthy, per appliance, worst first: 100% means healthy every hour, 0% means it was never healthy.",
+                  "Alarms counts hours with no alarm open; loss, latency, jitter and MOS count hours within the Orchestrator's health thresholds.",
+                  "\u2713 99% or more \u00b7 ! 95 to 99% \u00b7 \u2715 under 95% \u00b7 no data: the Orchestrator rated nothing for it."]
+    chart: Dict[str, Any] = {}
+    if per_category:
+        cell = lambda pct: {"value": pct, "text": "no data" if pct is None else "{:.1f}%".format(pct), "status": band(pct, (95.0, 99.0))}
+        chart = {"kind": "table", "rows": [{"category": _cap(HEALTH_LABELS[v]), "last_24_hours": cell(shares[v]["24h"]["all"]), "last_7_days": cell(shares[v]["7d"]["all"])}
+                                           for v in per_category]}
+        # Sites needing attention count unhealthy network hours (loss, latency, jitter): alarms are counted on their own, and MOS and
+        # utilisation hang on threshold settings that can rate every site unhealthy at once.
+        bad_hours.clear()
+        for v in ("LOSS", "LATENCY", "JITTER"):
+            for ne, entries in (per_category.get(v) or {}).items():
+                for entry in entries if isinstance(entries, list) and ne in names else []:
+                    status = str(entry.get("status") or "").upper()
+                    if status in HEALTH_RANK and status not in GOOD_HEALTH and float(entry.get("time") or 0) >= now_s - 86400:
+                        bad_hours[ne] = bad_hours.get(ne, 0) + 1
+    sections["noc-health"] = {"status": health_status, "metrics": health_ids[:2], "table": table, "notes": notes, "chart": chart}
 
     # Tunnels down now, from the cached tunnel state (one network-wide read each).
     tunnel_ids, tunnel_rows, tunnel_status = [], [], []
@@ -1503,7 +1528,7 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     scored.sort(key=lambda r: -r["score"])
     sections["noc-worst"] = {"status": "green" if not scored else worst([state_status, alarm_status, worst(tunnel_status)]), "table": scored,
                              "metrics": [metric("sites_needing_attention", len(scored), "appliances", "Appliances needing attention")],
-                             "notes": ["Score: not normal 100, each critical alarm 10, each major 3, each tunnel down 2, each unhealthy hour 1."]}
+                             "notes": ["Score: not normal 100, each critical alarm 10, each major 3, each tunnel down 2, each hour of unhealthy loss, latency or jitter in the last 24 hours 1."]}
     sections["noc-summary"] = {"status": worst([state_status, alarm_status, health_status, worst(tunnel_status)]),
                                "metrics": ["state_unreachable", "active_critical", "active_major", "tunnels_bonded_down", "health_good_24h_pct", "sites_needing_attention"]}
     return sections
@@ -1511,6 +1536,10 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 HEALTH_RANK = {"HEALTHY": 0, "WARNING": 1, "MINOR": 2, "MAJOR": 3, "CRITICAL": 4}
 HEALTH_LABELS = {"ALARM": "alarms", "LOSS": "loss", "LATENCY": "latency", "JITTER": "jitter", "MOS": "MOS", "BW_UTILIZATION": "utilisation"}
+
+
+def _cap(word: str) -> str:
+    return word[:1].upper() + word[1:]
 
 
 def _combine_health(per_category: Mapping[str, Any]) -> Dict[Any, List[Dict[str, Any]]]:
@@ -1899,6 +1928,11 @@ def _fmt(metric: Mapping[str, Any], unit_word: bool = True) -> str:
     return "{}{}".format(value, unit if unit == "%" else (" " + unit if unit and unit_word else ""))
 
 
+def _key_point(metric: Mapping[str, Any]) -> str:
+    """One bullet per summary figure, its status word when it has one: "Paths within every health threshold: 61.02% (Critical)"."""
+    return "{}: {}{}".format(metric["label"], _fmt(metric), " ({})".format(layout.status_of(metric["status"])[2]) if metric.get("status") else "")
+
+
 def options_line(metrics: Mapping[str, Any]) -> str:
     """Report options: what the reader needs to know was chosen, for example "down tunnels: separate (37 excluded)"."""
     o = dict(DEFAULT_OPTIONS, **(metrics.get("options") or {}))
@@ -1924,15 +1958,12 @@ def _figure(sid: str, sec: Mapping[str, Any]) -> str:
     chart = sec.get("chart") or {}
     if chart.get("kind") == "line" and chart.get("series"):
         return layout.line(str(chart.get("title") or ""), chart["series"], str(chart.get("unit") or ""), chart.get("threshold"))
+    if chart.get("kind") == "table" and chart.get("rows"):
+        return layout.table(chart["rows"])
     if chart.get("kind") == "bullets" and chart.get("items"):
         return layout.bullets(str(chart.get("title") or ""), chart["items"], chart["low"], chart["high"])
     if chart.get("points"):
         return layout.bars(str(chart.get("title") or ""), [(p[0], p[1]) for p in chart["points"]], bool(chart.get("zoom")))
-    rows = sec.get("table") or []
-    if sid == "noc-health" and rows:
-        columns = [k for k in rows[0] if k != "appliance"]
-        cells = [(r["appliance"], [("no data" if r[c] is None else "{:.0f}%".format(r[c]), band(r[c], (95.0, 99.0)), "") for c in columns]) for r in rows]
-        return layout.grid("Share of the last 24 hours each category was healthy", cells, [HEALTH_LABELS.get(c.upper(), c) for c in columns])
     return ""
 
 
@@ -1947,15 +1978,18 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
     texts = (narrative or {}).get("sections") or {}
     order = [sid for sid, _ in _section_list(metrics) if sid in metrics["sections"]]  # metrics.json keys are sorted
     shown = lambda mid: (metrics["metrics"][mid]["label"], _fmt(metrics["metrics"][mid]), metrics["metrics"][mid].get("status"))
+    summary_like = lambda sid: sid.endswith("-summary") or (sid.startswith("exec-") and sid != "exec-actions")  # these show their figures as key points
     parts, index, appendix = [], [], []  # type: List[str], List[Tuple[str, str, str]], List[str]
     for number, sid in enumerate(order, 1):
         sec = metrics["sections"][sid]
         text = html.escape((texts.get(sid) or {}).get("text") or "")
         text = _TOKEN.sub(lambda m: html.escape(_fmt(metrics["metrics"][m.group(1)], unit_word=False)), text)
         parts.append(layout.section(sid, number, titles[sid], sec["status"], '<p class="summary">{}</p>'.format(text) if text else "", _figure(sid, sec),
-                                    layout.stats([shown(mid) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]), sec.get("table") or [],
+                                    "" if summary_like(sid) else layout.stats([shown(mid) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]), sec.get("table") or [],
                                     sec.get("notes", []), appendix, [c["text"] for c in sec.get("causes", [])], [a["text"] for a in sec.get("actions", [])],
-                                    [TITLES[r] for r in NEXT.get(sid.split("-")[0], ()) if r != name]))
+                                    [TITLES[r] for r in NEXT.get(sid.split("-")[0], ()) if r != name], sec.get("apart"),
+                                    [_key_point(metrics["metrics"][mid]) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]
+                                    if summary_like(sid) else []))
         index.append((sid, "{} {}".format(number, titles[sid]), sec["status"]))
     areas = [sid for sid in order if sid != "data-gaps"]
     head = metrics.get("headline")
