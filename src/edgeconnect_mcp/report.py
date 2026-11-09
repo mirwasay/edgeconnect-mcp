@@ -753,7 +753,7 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
                                   "notes": ["Rule: any appliance down is amber; more than 10% down is red. The appliance list is in the availability and NOC reports."]}
         sections["exec-availability"] = {"status": worst([sections[sid]["status"] for sid in ("avail-appliances", "avail-tunnels", "avail-paths")]),
                                          "metrics": ["fleet_reach_pct", "overlay_avail_pct", "underlay_avail_pct", "appliances_below_target", "paths_red"]}
-        sections["exec-alarms"] = dict(sections["noc-alarms"], table=[])
+        sections["exec-alarms"] = dict(sections["noc-alarms"], table=[], counts=[], sums=[])
         sections["exec-licensing"] = dict(sections["life-licences"], table=[])
         sections["exec-software"] = {"status": metrics["ecos_trains"]["status"], "metrics": ["ecos_versions", "ecos_trains", "orchestrator_version"],
                                      "notes": ["Rule: more than one ECOS train in use is amber."]}
@@ -799,14 +799,21 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     if silent and names:
         gaps.insert(0, "{} of {} appliances returned no data for this report, so the figures leave them out (listed in the table).".format(len(silent), len(names)))
         gap_rows[:0] = [{"appliance": str(names[ne]), "gap": "returned no data for this report"} for ne in sorted(silent, key=lambda ne: str(names[ne]))]
+    merged: Dict[str, List[str]] = {}
+    for r in gap_rows:  # one row per appliance, every gap it has
+        merged.setdefault(r["appliance"], [])
+        if r["gap"] not in merged[r["appliance"]]:
+            merged[r["appliance"]].append(r["gap"])
+    gap_rows[:] = [{"appliance": a, "gap": "; ".join(g)} for a, g in merged.items()]
     sections["data-gaps"] = {"status": "grey" if gaps or gap_rows else "green", "metrics": [], "table": gap_rows,
                              "notes": gaps or ["None: every call returned data for every appliance in scope."]}
     headline = None
+    # The verdict and title name exactly the sections the index flags (rule 1 of consistency()): one list, used everywhere.
+    attention = [title for sid, title in section_list if sid not in NOT_AREAS and sections[sid]["status"] in ("amber", "red")]
     if report in ("executive", "operations") + STITCHED:
-        areas = [sid for sid, _ in section_list if sid not in ("data-gaps", "exec-actions", "ops-actions")]
+        areas = [sid for sid, _ in section_list if sid not in NOT_AREAS]
         overall = worst([sections[sid]["status"] for sid in areas])
-        attention = [dict(section_list)[sid] for sid in areas if sections[sid]["status"] in ("amber", "red") and not sid.endswith("-summary")]
-        kpis = EXEC_KPIS if report == "executive" else ("state_unreachable", "active_critical", "health_good_24h_pct", "tunnels_bonded_down", "paths_ok_pct", "worst_p95_pct",
+        kpis = EXEC_KPIS if report == "executive" else ("state_unreachable", "active_critical", "health_good_24h_pct", "tunnels_down", "paths_ok_pct", "worst_p95_pct",
                                                          "wan_bytes_total", "fleet_reach_pct", "act_alarms", "opt_reduction_pct", "sec_flows_dropped")
         headline = {"status": overall, "kpis": [k for k in kpis if k in metrics][:6],
                     "text": "Overall: {}. {}.".format(layout.STATUS[overall][2], "No area needs attention" if not attention else "Attention needed in " + ", ".join(attention))}
@@ -818,10 +825,11 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
             "coverage": {"appliances": len(names), "with_data": answered}, "stats_store_down": stats_down,
             "options": dict(options, down_tunnels_count=metrics.get("tunnel_groups_down_all_period", {}).get("value"),
                             idle_paths_count=metrics.get("paths_idle_probe_loss", {}).get("value")),
-            "headline": headline, "metrics": metrics, "section_list": [list(i) for i in section_list], "sections": {sid: sections[sid] for sid, _ in section_list}}
+            "headline": headline, "attention": attention, "metrics": metrics, "section_list": [list(i) for i in section_list], "sections": {sid: sections[sid] for sid, _ in section_list}}
 
 
 _RANK = {"grey": 0, "green": 1, "amber": 2, "red": 3}
+NOT_AREAS = ("data-gaps", "exec-actions", "ops-actions")  # in the index, but not areas a verdict counts: one lists gaps, the others repeat actions
 _RECONCILE = re.compile(r"([\d,]+) listed = ([\d,]+) within the thresholds \+ ([\d,]+) between \+ ([\d,]+) outside \+ ([\d,]+) with no data")
 _OPEN_RECONCILE = re.compile(r"([\d,]+) already open \+ ([\d,]+) raised - ([\d,]+) cleared = ([\d,]+) open at the end")
 
@@ -834,15 +842,46 @@ def consistency(metrics: Mapping[str, Any]) -> List[str]:
     for mid, m in figures.items():
         if m.get("value") is None and m.get("status") == "green":
             problems.append("{}: no data shown as green".format(mid))
+    titles = dict((str(i[0]), str(i[1])) for i in metrics.get("section_list") or [])
+    flagged = [titles[sid] for sid in titles if sid not in NOT_AREAS and (metrics.get("sections") or {}).get(sid, {}).get("status") in ("amber", "red")]
+    if "attention" in metrics and list(metrics["attention"]) != flagged:  # rule 1: the verdict and title name what the index flags, no more, no less
+        problems.append("the verdict names {} areas but the index flags {} ({})".format(len(metrics["attention"]), len(flagged), ", ".join(flagged)))
+    down_now = {(r.get("appliance"), r.get("tunnel")) for sec in (metrics.get("sections") or {}).values() if sec.get("down_now_source")
+                for r in sec.get("table") or []}
     for sid, sec in (metrics.get("sections") or {}).items():
         listed = [mid for mid in sec.get("metrics") or [] if mid in figures]
+        table = [r for r in sec.get("table") or [] if isinstance(r, dict)]
+        for mid, status in sec.get("counts") or []:  # rule 2: a figure that counts a table's rows equals them
+            if mid in figures and figures[mid].get("value") is not None:
+                n = sum(1 for r in table if status is None or r.get("status") == status)
+                if figures[mid]["value"] != n:
+                    problems.append("{}: {} is {} but the table has {} rows".format(sid, mid, figures[mid]["value"], n) if status is None else
+                                    "{}: {} is {} but the table has {} {} rows".format(sid, mid, figures[mid]["value"], n, status))
+        for mid, column, flag in sec.get("sums") or []:  # rule 4: a total taken from a column equals the rows it says it counts
+            if mid in figures and figures[mid].get("value") is not None:
+                total = sum(r.get(column) or 0 for r in table if r.get(flag, "yes") == "yes")
+                if figures[mid]["value"] != total:
+                    problems.append("{}: {} is {} but the rows it counts add up to {}".format(sid, mid, figures[mid]["value"], total))
+        if down_now and not sec.get("down_now_source"):  # rule 3: a tunnel down now is marked wherever it is listed
+            for r in table + list((sec.get("apart") or {}).get("rows") or []):
+                if "tunnel" in r and (r.get("appliance"), r.get("tunnel")) in down_now and r.get("tunnel_now") != "down":
+                    problems.append("{}: {} {} is down now but not marked".format(sid, r.get("appliance"), r.get("tunnel")))
+        if sid == "data-gaps":  # rule 6: one row per appliance
+            seen: Dict[str, int] = {}
+            for r in table:
+                seen[str(r.get("appliance"))] = seen.get(str(r.get("appliance")), 0) + 1
+            problems += ["data-gaps: {} is listed {} times".format(a, n) for a, n in seen.items() if n > 1]
         for mid in listed:
             st = figures[mid].get("status")
             if st and _RANK.get(st, 0) > _RANK.get(sec.get("status"), 0) and sec.get("status") != "grey":
                 problems.append("{}: status {} is better than its figure {} ({})".format(sid, sec.get("status"), mid, st))
         if listed and sec.get("status") in ("amber", "red") and not sid.endswith("-summary") and not sid.startswith(("exec-", "ops-")) \
-                and figures[listed[0]].get("status") is None and figures[listed[0]].get("value") is not None:
-            problems.append("{}: its lead figure {} has no status although the section is {}".format(sid, listed[0], sec.get("status")))
+                and figures[listed[0]].get("value") is not None:  # rule 5: a flagged section leads with the figure that flags it
+            lead = figures[listed[0]].get("status")
+            if lead is None:
+                problems.append("{}: its lead figure {} has no status although the section is {}".format(sid, listed[0], sec.get("status")))
+            elif lead != sec.get("status"):
+                problems.append("{}: it is {} but its lead figure {} is {}".format(sid, sec.get("status"), listed[0], lead))
         for note in sec.get("notes") or []:
             for found in _RECONCILE.finditer(note):
                 n = [int(x.replace(",", "")) for x in found.groups()]
@@ -911,7 +950,8 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     fleet = _pct(total_reach, total_samples)
     m_fleet = metric("fleet_reach_pct", fleet, "%", "Appliance reachability, average over the period", band(fleet, limits))
     below = [r for r in rows if r["status"] in ("amber", "red")]
-    m_below = metric("appliances_below_target", len(below) if fleet is not None else None, "appliances", "Appliances below the reachability target")
+    m_below = metric("appliances_below_target", len(below) if fleet is not None else None, "appliances", "Appliances below the reachability target",
+                     (worst([r["status"] for r in below]) if below else "green") if fleet is not None else None)
     m_measured = metric("appliances_measured", sum(1 for r in rows if r["reachability_pct"] is not None), "appliances", "Appliances with reachability data")
     metric("reach_target_pct", max(limits), "%", "Reachability target")
     rows.sort(key=lambda r: (r["reachability_pct"] is None, r["reachability_pct"] if r["reachability_pct"] is not None else 0))
@@ -985,7 +1025,8 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     have_alarms = covered and (isinstance(listed, list) or any(("alarm_period:" + str(ne)) in data for ne in names))
     alarm_status = "grey" if not have_alarms else "red" if counts["CRITICAL"] else "amber" if counts["MAJOR"] else "green"
     alarm_ids = [metric("alarms_" + sev.lower(), counts[sev] if have_alarms else None, "alarms", sev.title() + " alarms in the period" + (
-        "" if covered else " (not counted: the Orchestrator keeps 7 days of alarms)")) for sev in counts]
+        "" if covered else " (not counted: the Orchestrator keeps 7 days of alarms)"),
+        None if not have_alarms or sev in ("MINOR", "WARNING") else ("red" if sev == "CRITICAL" else "amber") if counts[sev] else "green") for sev in counts]
     sections["avail-alarms"] = {"status": alarm_status, "metrics": alarm_ids, "table": alarm_rows, "notes": ["Source: " + source + "."] + (
         ["The counts are not shown: the Orchestrator keeps 7 days of alarms, which do not cover the period. The table lists only the alarms it still holds "
          "(the last 7 days and those still open), not every alarm of the period."] if not covered and alarm_rows else [])}
@@ -1133,7 +1174,8 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
     elif idle:
         notes.append("Under {} packets received in the period a loss % means little: a tunnel that lost probes there is shown as \"no traffic, probes lost\" and counted "
                      "red, usually a broken path or a dead configuration.".format(floor))
-    apart = [{"appliance": r["appliance"], "tunnel": r["tunnel"], "kind": r["kind"], "latency_ms": r["latency_ms"]} for r in broken]
+    apart = [dict({"appliance": r["appliance"], "tunnel": r["tunnel"], "kind": r["kind"], "latency_ms": r["latency_ms"]},
+                  **({"tunnel_now": r.get("tunnel_now", "")} if any(b.get("tunnel_now") for b in broken) else {})) for r in broken]
     flags = [(r.pop("_mos_only", False), r["status"]) for r in rows]
     for r in broken:
         r.pop("_mos_only", None)
@@ -1155,6 +1197,7 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
             for r in rows:
                 r.pop(column, None)
     return {"status": worst([r["status"] for r in rows]), "table": rows, "notes": notes,
+            "counts": [["paths_measured", None], ["paths_red", "red"], ["paths_amber", "amber"], ["paths_no_data", "grey"]],
             "apart": {"title": "Listed apart: tunnels with no traffic that lost probes", "rows": apart},
             "metrics": [metric("paths_measured", len(rows), "tunnels", "Tunnels listed"),
                         metric("paths_graded", len(rows) - no_data, "tunnels", "Tunnels graded (with packets received)"),
@@ -1295,6 +1338,7 @@ def _optimisation(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     top2 = _pct(sum(max(0, r["saved_bytes"]) for r in rows[:2]), saved_total) if saved_total else None
     listed = {r["appliance"] for r in rows}
     absent = sorted(str(n) for n in names.values() if n not in listed)
+    ctx["gap_rows"].extend({"appliance": n, "gap": "no optimised-traffic flow records"} for n in absent)  # the same list as the note below
     status = "green" if rows else "grey"
     ids = [metric("opt_reduction_pct", _pct(lan - wan, lan), "%", "Reduction of optimised traffic"), metric("opt_saved_bytes", lan - wan if rows else None, "bytes", "WAN bytes saved"),
            metric("opt_top2_share_pct", top2, "%", "Share of the bytes saved that comes from the 2 appliances saving most"),
@@ -1362,7 +1406,7 @@ def _security(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
            metric("sec_pairs_all_dropped", sum(1 for r in rows if r["flows_dropped"] and not r["flows_allowed"]) if rows else None, "zone pairs", "Zone pairs with every flow dropped"),
            metric("sec_pairs_flagged", blocked if rows else None, "zone pairs", "Zone pairs flagged (every flow, or 10% or more, dropped)", "amber" if blocked else "green" if rows else None)]
     return {"sec-summary": {"status": status, "metrics": ids},
-            "sec-pairs": {"status": status, "metrics": [], "table": rows, "notes": ["Rule: a zone pair whose every flow was dropped, or that dropped at least 10% of its flows and at least 1,000 flows, is a warning: confirm "
+            "sec-pairs": {"status": status, "metrics": [], "table": rows, "counts": [["sec_pairs_flagged", "amber"]], "notes": ["Rule: a zone pair whose every flow was dropped, or that dropped at least 10% of its flows and at least 1,000 flows, is a warning: confirm "
                                                                        "the rule is meant. Those pairs are listed first."] + unknown + [
                                                                        "Policy drops are flows denied by a firewall rule; routing drops are packets with no route. Routing drops are not scored: "
                                                                        "a large number on a pair points to a missing route, not to the firewall."]}}
@@ -1420,6 +1464,8 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     # a bulk change ("Apply Appliance Templates") logs its own failure as well as each per-appliance one ("Apply Appliance Template"): count the per-appliance ones
     bulk = lambda r: str(r["change"] or "").endswith("s") and str(r["change"])[:-1] in singles
     failed = sum(r["failed"] for r in changes if not bulk(r))
+    for r in changes:  # which rows the failed total counts: a bulk change is counted by its per-appliance changes, not again by itself
+        r["in_total"] = "no (bulk)" if bulk(r) else "yes"
     # a change type that failed at least half of 100 or more attempts is a loop that is not working, not an odd failure
     looping = [r for r in changes if r["times"] >= 100 and r["failed"] * 2 >= r["times"]]
     ids = [metric("act_changes", sum(r["times"] for r in changes) if audit is not None else None, "changes", "Changes in the audit log"),
@@ -1429,6 +1475,7 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
            metric("act_median_clear_min", round(statistics.median(to_clear), 1) if to_clear else None, "minutes", "Median time to clear (cleared alarms only)")]
     return {"act-summary": {"status": "red" if looping else "amber" if failed or repeat_rows else "green", "metrics": ids},
             "act-changes": {"status": "red" if looping else "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes,
+                            "sums": [["act_changes_failed", "failed", "in_total"]],
                             "notes": ["Changes grouped by user and type, those with failures first; system users such as OverlayManager are the Orchestrator's own automation.",
                                       "Rule: any failure is a warning; a change type that failed at least half of 100 or more attempts is critical (a retry loop that is not working)."]
                             + (["A bulk change (for example \"Apply Appliance Templates\") and the per-appliance changes it starts (\"Apply Appliance Template\") are both logged, "
@@ -1437,7 +1484,7 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             "act-alarms": {"status": "grey" if not type_rows else "red" if any(r["severity"] == "critical" for r in type_rows)
                            else "amber" if any(r["severity"] == "major" for r in type_rows) else "green", "metrics": [], "table": type_rows,
                            "notes": ["Rule: the worst severity raised sets the status (critical red, major amber)."]},
-            "act-repeat": {"status": "amber" if repeat_rows else "green", "metrics": [], "table": repeat_rows, "notes": ["An alarm raised 3 or more times on one appliance in the window."]},
+            "act-repeat": {"status": "amber" if repeat_rows else "green", "metrics": [], "table": repeat_rows, "counts": [["act_repeat", None]], "notes": ["An alarm raised 3 or more times on one appliance in the window."]},
             "act-after-change": {"status": "amber" if after else "green", "metrics": [], "table": after,
                                  "notes": ["Alarms raised within an hour after a change made by a person on the same appliance, oldest first. The Orchestrator's own automation "
                                            "changes appliances every few seconds, so its changes are not used here. Timing only: it does not show that the change caused the alarm."]}}
@@ -1776,7 +1823,8 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             str(r["tunnel"] or "").startswith("to_{}_".format(n)) for n in down_names) else ""
     tunnel_ids.append(metric("tunnels_down_peer_unreachable", sum(bool(r["unreachable_end"]) for r in tunnel_rows), "tunnels",
                              "Tunnels down where one end is an unreachable appliance"))
-    sections["noc-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_ids, "table": tunnel_rows,
+    tunnel_ids.insert(0, metric("tunnels_down", len(tunnel_rows), "tunnels", "Tunnels down (bonded and physical)", worst(tunnel_status)))
+    sections["noc-tunnels"] = {"status": worst(tunnel_status), "metrics": tunnel_ids, "table": tunnel_rows, "counts": [["tunnels_down", None]], "down_now_source": True,
                                "notes": ["Rule: any tunnel not up is amber; more than 10% of tunnels is red. Bonded tunnels are the overlays, listed first; physical tunnels are the underlay.",
                                          "Down - In progress: the appliance is still trying to bring the tunnel up (its keepalives or IPsec negotiation are not completing)."]}
 
@@ -1794,11 +1842,11 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                            "tunnels_down": down_per_ne.get(ne, 0), "unhealthy_hours_24h": None if ne in unrated_now else bad_hours.get(ne, 0), "score": score})
     scored.sort(key=lambda r: -r["score"])
     noc_worst_status = "green" if not scored else worst([state_status, alarm_status, worst(tunnel_status)])
-    sections["noc-worst"] = {"status": noc_worst_status, "table": scored,
+    sections["noc-worst"] = {"status": noc_worst_status, "table": scored, "counts": [["sites_needing_attention", None]],
                              "metrics": [metric("sites_needing_attention", len(scored), "appliances", "Appliances needing attention", noc_worst_status)],
                              "notes": ["Score: not normal 100, each critical alarm 10, each major 3, each tunnel down 2, each hour of unhealthy loss, latency or jitter in the last 24 hours 1."]}
     sections["noc-summary"] = {"status": worst([state_status, alarm_status, health_status, worst(tunnel_status)]),
-                               "metrics": ["state_unreachable", "active_critical", "active_major", "tunnels_bonded_down", "health_good_24h_pct", "sites_needing_attention"]}
+                               "metrics": ["state_unreachable", "active_critical", "active_major", "tunnels_down", "health_good_24h_pct", "sites_needing_attention"]}
     return sections
 
 
@@ -2348,16 +2396,16 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
                                     [_key_point(metrics["metrics"][mid]) for mid in sec.get("metrics", []) if mid in metrics["metrics"]]
                                     if summary_like(sid) else []))
         index.append((sid, "{} {}".format(number, titles[sid]), sec["status"]))
-    areas = [sid for sid in order if sid not in ("data-gaps", "exec-actions", "ops-actions")]  # the action lists repeat the areas' actions; they are not areas
+    areas = [sid for sid in order if sid not in NOT_AREAS]
     head = metrics.get("headline")
     if head:
         overall, verdict, kpis = head["status"], head["text"], head["kpis"]
     else:
         overall = worst([metrics["sections"][sid]["status"] for sid in areas])
-        attention = [titles[sid] for sid in areas if metrics["sections"][sid]["status"] in ("amber", "red") and not sid.endswith("-summary")]  # a summary repeats the others
+        attention = metrics.get("attention", [titles[sid] for sid in areas if metrics["sections"][sid]["status"] in ("amber", "red")])
         verdict = "Attention needed in " + ", ".join(attention) + "." if attention else "No area needs attention." if overall != "grey" else "No data to judge."
         kpis = [m for m in metrics["sections"][areas[0]].get("metrics", []) if m in metrics["metrics"]] if areas else []
-    attention_count = sum(metrics["sections"][sid]["status"] in ("amber", "red") and not sid.endswith("-summary") for sid in areas)
+    attention_count = len(metrics.get("attention", [sid for sid in areas if metrics["sections"][sid]["status"] in ("amber", "red")]))
     now = metrics["period"].get("now_s")
     as_of = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if now else metrics["collected_at"]
     period = {"noc": "last 24 hours and 7 days to " + as_of, "lifecycle": "as of " + as_of,

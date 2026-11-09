@@ -854,7 +854,7 @@ class LayoutTests(unittest.TestCase):
         marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
                  'data-section-id="avail-summary"', "<footer>"]
         self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
-        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # appliances, tunnels, transports, alarms (the summary repeats them)  # the title is the message
+        self.assertIn("<h1>Availability report, 2026-10: 5 areas need attention</h1>", page)  # summary, appliances, tunnels, transports, alarms: as the index flags them  # the title is the message
         self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
         self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
 
@@ -1668,10 +1668,11 @@ class PersonaReviewRound3Tests(unittest.TestCase):
         m = report.compute(phase2_bundle("lifecycle", **{"backup:1.NE": [{"backupTime": NOW - 100 * 86400}]}))
         self.assertEqual(m["sections"]["life-backups"]["status"], "red")
 
-    def test_summary_sections_are_not_counted_as_areas(self):
+    def test_the_verdict_names_what_the_index_flags(self):
+        # Reversed 2026-11-09 (round 6): leaving summaries out made the verdict disagree with the index, which readers count.
         page = report.render(report.compute(phase2_bundle("lifecycle", **{"backup:1.NE": [{"backupTime": NOW - 100 * 86400}]})))
         verdict = page[page.index('data-section-id="verdict"'):page.index('<nav class="toc"')]
-        self.assertNotIn("Lifecycle summary", verdict)
+        self.assertIn("Lifecycle summary", verdict)
 
     def test_noc_alarm_counts_explain_rows_against_alarms_and_new_ones(self):
         same = {"applianceId": "1.NE", "severity": "MAJOR", "description": "Tunnel down", "timeOccurredInMills": (NOW - 3600) * 1000}
@@ -2041,6 +2042,76 @@ class ReviewOfRound5FixesTests(unittest.TestCase):
         rows = [{"status": "grey", "check": "x", "p95_out_pct": 27.0, "p95_in_pct": 1.0}, {"status": "green", "check": "", "p95_out_pct": 2.0, "p95_in_pct": None},
                 {"status": "grey", "check": "", "p95_out_pct": None, "p95_in_pct": None}]
         self.assertEqual(report._with_p95(rows), 2)
+
+
+class GeneralRuleTests(unittest.TestCase):
+    """The six must-fix items as general rules (owner, 2026-11-09: "the fix should work in every scenario"). Each rule is a consistency()
+    check, run on every report type over several synthetic scenarios, not only on the seteam pages."""
+
+    path = PersonaReviewTests.path
+
+    def scenarios(self):
+        """Every report type, with data that triggers each rule: an unreachable appliance, tunnels down (graded, no data and idle),
+        bulk and per-appliance failed changes, a MOS setting, flow records missing for one appliance."""
+        h = HealthByCategoryTests.hours
+        paths = {"a": {"1.NE": self.path("to_hub_DEFAULT", 50000, 0)}, "b": {"1.NE": self.path("to_x_DEFAULT", 0, 0)},
+                 "c": {"1.NE": self.path("to_y_DEFAULT", 0, 50)}, "d": {"1.NE": self.path("to_z_DEFAULT", 50000, 5000)}}
+        down = {"1.NE": {k: {"alias": a, "operStatus": "Down"} for k, a in (("1", "to_hub_DEFAULT"), ("2", "to_x_DEFAULT"), ("3", "to_y_DEFAULT"))}}
+        audit = [{"user": "OverlayManager", "name": n, "nepk": "1.NE", "queuedTime": i, "completionStatus": False}
+                 for i, n in enumerate(["Apply Appliance Template"] * 3 + ["Apply Appliance Templates"])]
+        flows = {"OPTIMIZED_TRAFFIC": {"X": {"1.NE": {"nePk": "1.NE", "SUM_LRX_BYTES": 1000, "SUM_LTX_BYTES": 0, "SUM_WTX_BYTES": 100, "SUM_WRX_BYTES": 0}}}}
+        data = {"health_threshold": THRESHOLDS, "tunnels_bonded": down, "tunnels_physical": {"1.NE": {"p": {"alias": "to_hub_INETA-INETA", "operStatus": "Down"}}},
+                "paths:1.NE": paths, "activity_audit": audit, "flows:1.NE": flows,
+                "active_alarms": [{"applianceId": "1.NE", "severity": "CRITICAL", "description": "x", "timeOccurredInMills": (NOW - 100) * 1000}],
+                "health:LOSS": {"1.NE": h("HEALTHY")}, "health:MOS": {"1.NE": h("MAJOR")}, "health:ALARM": {"1.NE": h("MAJOR")},
+                "backup:1.NE": [{"backupTime": NOW - 100 * 86400}], "backup:2.NE": [{"backupTime": NOW - 86400}],
+                "security:1.NE": [{"nePk": "1.NE", "fromZone": "1", "toZone": "0", "flows_allowed": 0, "flows_dropped": 50}]}
+        appliances = [dict(APPLIANCES[0]), dict(APPLIANCES[1])]  # branch-b unreachable
+        for name in report.REPORTS:
+            if name == "incident":
+                continue
+            b = phase2_bundle(name, appliances=appliances, **data)
+            if name == "custom":
+                b["options"] = {"parts": ["optimisation", "security"]}
+            if name == "site":
+                b["data"]["appliances"] = [appliances[0]]
+            yield name, b
+
+    def test_every_report_type_passes_every_rule_in_every_scenario(self):
+        for name, b in self.scenarios():
+            with self.subTest(report=name):
+                self.assertEqual(report.consistency(report.compute(b)), [])
+
+    def test_rule_1_the_title_counts_exactly_the_flagged_sections_of_the_index(self):
+        m = {"report": "x", "metrics": {}, "headline": None, "attention": ["A"], "section_list": [["a", "A"], ["b-summary", "B"], ["data-gaps", "Data gaps"]],
+             "sections": {"a": {"status": "red", "metrics": []}, "b-summary": {"status": "red", "metrics": []}, "data-gaps": {"status": "grey", "metrics": []}}}
+        self.assertIn("the verdict names 1 areas but the index flags 2 (A, B)", report.consistency(m))
+
+    def test_rule_2_a_count_declared_for_a_table_equals_its_rows(self):
+        m = {"report": "x", "metrics": {"n": {"value": 2, "status": "red", "label": "n", "unit": ""}}, "headline": None, "section_list": [["s", "s"]],
+             "sections": {"s": {"status": "red", "metrics": ["n"], "table": [{"a": 1}, {"a": 2}, {"a": 3}], "counts": [["n", None]]}}}
+        self.assertIn("s: n is 2 but the table has 3 rows", report.consistency(m))
+
+    def test_rule_3_a_tunnel_down_now_is_marked_wherever_it_is_listed(self):
+        m = {"report": "x", "metrics": {}, "headline": None, "section_list": [["t", "t"], ["p", "p"]],
+             "sections": {"t": {"status": "red", "metrics": [], "down_now_source": True, "table": [{"appliance": "a", "tunnel": "to_x", "state": "Down"}]},
+                          "p": {"status": "green", "metrics": [], "table": [{"appliance": "a", "tunnel": "to_x", "status": "grey"}], "apart": {"rows": []}}}}
+        self.assertIn("p: a to_x is down now but not marked", report.consistency(m))
+
+    def test_rule_4_a_total_declared_from_a_column_equals_its_sum(self):
+        m = {"report": "x", "metrics": {"f": {"value": 5, "status": "red", "label": "f", "unit": ""}}, "headline": None, "section_list": [["s", "s"]],
+             "sections": {"s": {"status": "red", "metrics": ["f"], "table": [{"failed": 3, "in_total": "yes"}, {"failed": 4, "in_total": "no"}], "sums": [["f", "failed", "in_total"]]}}}
+        self.assertIn("s: f is 5 but the rows it counts add up to 3", report.consistency(m))
+
+    def test_rule_5_a_flagged_section_leads_with_a_figure_of_its_own_status(self):
+        m = {"report": "x", "metrics": {"x": {"value": 99.9, "status": "green", "label": "x", "unit": "%"}}, "headline": None, "section_list": [["s", "s"]],
+             "sections": {"s": {"status": "red", "metrics": ["x"]}}}
+        self.assertIn("s: it is red but its lead figure x is green", report.consistency(m))
+
+    def test_rule_6_data_gaps_name_each_appliance_once(self):
+        m = {"report": "x", "metrics": {}, "headline": None, "section_list": [["data-gaps", "Data gaps"]],
+             "sections": {"data-gaps": {"status": "grey", "metrics": [], "table": [{"appliance": "a", "gap": "x"}, {"appliance": "a", "gap": "y"}]}}}
+        self.assertIn("data-gaps: a is listed 2 times", report.consistency(m))
 
 
 if __name__ == "__main__":
