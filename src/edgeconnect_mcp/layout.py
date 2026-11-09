@@ -220,6 +220,10 @@ def number(column: str, value: float) -> str:
         return "{:,.2f}".format(value)
     if column.endswith("_ms"):
         return "{:,.0f}".format(value)
+    if column.endswith("drop_pct"):
+        return "{:,.4f}".format(value)  # drop rates are tiny: 4 decimals so they do not read as 0
+    if column.endswith("_pct") and 0 < abs(value) < 0.05:
+        return "<0.1"  # not 0.0: something did happen
     return "{:,.1f}".format(value) if column.endswith("_pct") else "{:,.2f}".format(value)
 
 

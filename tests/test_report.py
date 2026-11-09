@@ -256,7 +256,7 @@ class NocTests(unittest.TestCase):
                              "tunnels_physical_down": 1, "tunnels_physical_total": 3})
         s = {sid: sec["status"] for sid, sec in m["sections"].items()}
         self.assertEqual((s["noc-appliances"], s["noc-alarms"], s["noc-health"], s["noc-tunnels"], s["noc-summary"]), ("red", "red", "red", "red", "red"))
-        self.assertIn("keeps 7 days of alarm history", " ".join(m["sections"]["noc-alarms"]["notes"]))
+        self.assertIn("keeps 7 days of history for cleared alarms", " ".join(m["sections"]["noc-alarms"]["notes"]))
         worst = m["sections"]["noc-worst"]["table"]
         self.assertEqual([(r["appliance"], r["score"]) for r in worst], [("branch-b<script>", 110), ("branch-a", 3)])  # not normal + critical; tunnel down + unhealthy hour
 
@@ -310,7 +310,7 @@ class LifecycleTests(unittest.TestCase):
         v = {k: m["metrics"][k]["value"] for k in ("licences_expiring_30", "licences_expiring_90", "backups_stale", "advisory_hits", "ecos_trains")}
         self.assertEqual(v, {"licences_expiring_30": 1, "licences_expiring_90": 2, "backups_stale": 1, "advisory_hits": 1, "ecos_trains": 2})
         s = {sid: sec["status"] for sid, sec in m["sections"].items()}
-        self.assertEqual((s["life-licences"], s["life-backups"], s["life-advisories"], s["life-eol"], s["life-summary"]), ("red", "amber", "red", "grey", "red"))
+        self.assertEqual((s["life-licences"], s["life-backups"], s["life-advisories"], s["life-eol"], s["life-summary"]), ("red", "red", "red", "grey", "red"))  # a backup row over 90 days, or none, is red (round 3)
         self.assertEqual(m["sections"]["life-advisories"]["table"][0]["target"], "Orchestrator")
         page = report.render(m)
         self.assertIn("<title>Lifecycle, licence and vulnerability report, as of 2026-09-21", page)
@@ -627,7 +627,7 @@ class IncidentTests(CollectTests):
         # raised in the window first, then those already open (even a month-old one, from the open-now read); the one cleared before is out
         self.assertEqual([r["alarm"] for r in timeline], ["TUNNEL_DOWN", "BAD_IP", "STANDING", "LINK"])  # worst severity first (persona review 2026-11-09)
         v = {k: m["metrics"][k]["value"] for k in ("inc_alarms", "inc_critical", "inc_open_at_end", "inc_median_clear_min", "inc_changes_before", "inc_changes_during", "inc_affected")}
-        self.assertEqual(v, {"inc_alarms": 4, "inc_critical": 2, "inc_open_at_end": 3, "inc_median_clear_min": 20.0, "inc_changes_before": 1, "inc_changes_during": 2, "inc_affected": 1})
+        self.assertEqual(v, {"inc_alarms": 4, "inc_critical": 1, "inc_open_at_end": 3, "inc_median_clear_min": 20.0, "inc_changes_before": 1, "inc_changes_during": 2, "inc_affected": 1})
         self.assertEqual(m["sections"]["inc-appliances"]["table"][0]["reachable_pct"], 83.333)  # 10 of 60 minutes unreachable
         self.assertEqual(m["sections"]["inc-summary"]["status"], "red")
         self.assertIn("does not say whether any change caused", " ".join(m["sections"]["inc-changes"]["notes"]))
@@ -854,7 +854,7 @@ class LayoutTests(unittest.TestCase):
         marks = ['class="rpt-head"', 'data-section-id="report-options"', 'data-section-id="verdict"', 'nav class="toc"', 'data-section-id="kpi-strip"',
                  'data-section-id="avail-summary"', "<footer>"]
         self.assertEqual([page.index(m) for m in marks], sorted(page.index(m) for m in marks))
-        self.assertIn("<h1>Availability report, 2026-10: 5 areas need attention</h1>", page)  # summary, appliances, tunnels, transports, alarms  # the title is the message
+        self.assertIn("<h1>Availability report, 2026-10: 4 areas need attention</h1>", page)  # appliances, tunnels, transports, alarms (the summary repeats them)  # the title is the message
         self.assertIn('<span class="pill warning"><span aria-hidden="true">!</span> Warning</span>', page)
         self.assertNotRegex(page, r"(?i)<script|<(link|img|iframe)\b|src=|https?://")
 
@@ -1443,7 +1443,7 @@ class PersonaReviewTests(unittest.TestCase):
         b = phase2_bundle("security", **{"security:1.NE": [{"nePk": "1.NE", "fromZone": "1", "toZone": "2", "flows_allowed": 1, "flows_dropped": 0}]})
         del b["data"]["reach:2.NE"]
         sec = report.compute(b)["sections"]["data-gaps"]
-        self.assertIn("1 of 2 appliances returned no data for this report, so the figures leave them out: branch-b<script>", " ".join(sec["notes"]))
+        self.assertIn("1 of 2 appliances returned no data for this report", " ".join(sec["notes"]))  # named in its table (round 3)
         self.assertNotEqual(sec["status"], "green")
 
     def test_figures_have_thousands_separators_and_plural_units_read_right(self):
@@ -1640,6 +1640,85 @@ class PersonaReviewRound2Tests(unittest.TestCase):
     def test_executive_tiles_say_what_period_they_cover(self):
         m = report.compute(phase2_bundle("availability"))
         self.assertIn("average over the period", m["metrics"]["fleet_reach_pct"]["label"])
+
+
+class PersonaReviewRound3Tests(unittest.TestCase):
+    """Third set of fresh readers (2026-11-09): every report now "with changes"; what still misled."""
+
+    path = PersonaReviewTests.path
+
+    def test_fully_dropped_pairs_and_flagged_pairs_are_counted_apart(self):
+        rows = [{"nePk": "1.NE", "fromZone": "1", "toZone": "3", "flows_allowed": 5000, "flows_dropped": 4000},
+                {"nePk": "1.NE", "fromZone": "3", "toZone": "0", "flows_allowed": 0, "flows_dropped": 50}]
+        m = report.compute(phase2_bundle("security", zones={"1": {"name": "SOHO"}, "3": {"name": "TRUSTED"}}, **{"security:1.NE": rows}))
+        self.assertEqual((m["metrics"]["sec_pairs_all_dropped"]["value"], m["metrics"]["sec_pairs_flagged"]["value"]), (1, 2))
+        self.assertIn("Routing drops are not scored", " ".join(m["sections"]["sec-pairs"]["notes"]))
+
+    def test_incident_appliances_are_rated_on_the_window_and_in_window_alarms_come_first(self):
+        old = {"id": 1, "applianceId": "1.NE", "severity": "CRITICAL", "timeOccurredInMills": T0 - 30 * 86400000}
+        new = {"id": 2, "applianceId": "1.NE", "severity": "WARNING", "timeOccurredInMills": T0 + 1000}
+        b = bundle(incident={"from_ms": T0, "to_ms": T0 + 3600000, "affected": ["1.NE"]}, incident_alarms_stored=True, incident_alarms=[old, new])
+        b["report"] = "incident"
+        m = report.compute(b)
+        self.assertEqual([r["severity"] for r in m["sections"]["inc-timeline"]["table"]], ["warning", "critical"])
+        self.assertEqual(m["sections"]["inc-appliances"]["table"][0]["status"], "grey")  # no reachability samples, only a warning raised: not Good
+        self.assertEqual(m["metrics"]["inc_critical"]["value"], 0)  # raised in the window
+
+    def test_backups_section_takes_its_worst_row(self):
+        m = report.compute(phase2_bundle("lifecycle", **{"backup:1.NE": [{"backupTime": NOW - 100 * 86400}]}))
+        self.assertEqual(m["sections"]["life-backups"]["status"], "red")
+
+    def test_summary_sections_are_not_counted_as_areas(self):
+        page = report.render(report.compute(phase2_bundle("lifecycle", **{"backup:1.NE": [{"backupTime": NOW - 100 * 86400}]})))
+        verdict = page[page.index('data-section-id="verdict"'):page.index('<nav class="toc"')]
+        self.assertNotIn("Lifecycle summary", verdict)
+
+    def test_noc_alarm_counts_explain_rows_against_alarms_and_new_ones(self):
+        same = {"applianceId": "1.NE", "severity": "MAJOR", "description": "Tunnel down", "timeOccurredInMills": (NOW - 3600) * 1000}
+        m = report.compute(phase2_bundle("noc", active_alarms=[same, dict(same)]))
+        self.assertEqual(m["metrics"]["active_new_24h"]["value"], 2)
+        notes = " ".join(m["sections"]["noc-alarms"]["notes"])
+        self.assertIn("1 row for 2 alarms", notes)
+
+    def test_tunnels_down_say_when_the_far_end_is_unreachable(self):
+        tunnels = {"1.NE": {"b": {"alias": "to_branch-b<script>_DEFAULT", "operStatus": "Down"}, "c": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}
+        m = report.compute(phase2_bundle("noc", tunnels_bonded=tunnels))
+        rows = {r["tunnel"]: r for r in m["sections"]["noc-tunnels"]["table"]}
+        self.assertEqual((rows["to_branch-b<script>_DEFAULT"]["peer_unreachable"], rows["to_hub_DEFAULT"]["peer_unreachable"]), ("yes", ""))
+        self.assertEqual(m["metrics"]["tunnels_down_peer_unreachable"]["value"], 1)
+
+    def test_paths_reconcile_line_places_the_tunnels_listed_apart(self):
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0)}, "b": {"1.NE": self.path("to_b", 0, 50)}}
+        m = report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))
+        self.assertIn("not counted in the 1 above", " ".join(m["sections"]["paths-ranked"]["notes"]))
+
+    def test_tiny_percentages_are_not_shown_as_zero(self):
+        self.assertEqual(layout.number("failed_pct", 0.0095), "<0.1")
+        self.assertEqual(layout.number("qos_drop_pct", 0.0072), "0.0072")
+
+    def test_highest_p95_leaves_out_links_with_an_odd_configured_bandwidth(self):
+        rows = [{"appliance": "a", "p95_out_pct": 27.0, "p95_in_pct": 1.0, "check": "check the configured bandwidth (under 1 Mbps)", "status": "green"},
+                {"appliance": "b", "p95_out_pct": 9.0, "p95_in_pct": 1.0, "check": "", "status": "green"}]
+        self.assertEqual(report._worst_p95(rows), 9.0)
+
+    def test_data_gaps_list_appliances_in_a_table_not_a_sentence(self):
+        b = phase2_bundle("security", **{"security:1.NE": [{"nePk": "1.NE", "fromZone": "1", "toZone": "2", "flows_allowed": 1, "flows_dropped": 0}]})
+        del b["data"]["reach:2.NE"]
+        sec = report.compute(b)["sections"]["data-gaps"]
+        self.assertIn({"appliance": "branch-b<script>", "gap": "returned no data for this report"}, sec["table"])
+        self.assertNotIn("branch-b<script>", " ".join(sec["notes"]))
+
+    def test_site_paths_mark_tunnels_that_are_down_now(self):
+        paths = {"a": {"1.NE": self.path("to_hub_DEFAULT", 50000, 0)}}
+        b = phase2_bundle("site", health_threshold=THRESHOLDS, tunnels_bonded={"1.NE": {"x": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}, **{"paths:1.NE": paths})
+        row = report.compute(b)["sections"]["paths-ranked"]["table"][0]
+        self.assertEqual(row["tunnel_now"], "down")
+
+    def test_activity_names_the_person_change_section_and_the_bulk_template_overlap(self):
+        audit = [{"user": "OverlayManager", "name": n, "nepk": "1.NE", "queuedTime": 1, "completionStatus": False} for n in ("Apply Appliance Template", "Apply Appliance Templates")]
+        m = report.compute(phase2_bundle("activity", activity_audit=audit))
+        self.assertEqual(dict(m["section_list"])["act-after-change"], "Alarms within an hour of a change by a person")
+        self.assertIn("can appear in both rows", " ".join(m["sections"]["act-changes"]["notes"]))
 
 
 if __name__ == "__main__":
