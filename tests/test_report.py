@@ -961,6 +961,31 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(b["options"]["period"], "last-7-days")
 
 
+class PathQualityTests(unittest.TestCase):
+    """R3 Path quality: every active path worst first, FEC hiding loss, and transports compared."""
+
+    def test_ranked_paths_fec_masking_and_transports(self):
+        t = lambda alias, ov, pre, post, rx, lat: {"1.NE": {"alias": alias, "overlayid": ov, "SUM_PRE_LOSS": pre, "SUM_POST_LOSS": post, "SUM_WRX_PKTS": rx,
+                                                            "AVG_LATENCY_AVG": lat, "AVG_JITTER": 1, "mos": 430}}
+        paths = {"a": t("to_hub_INETA-INETA", "0", 3000, 10, 97000, 10), "b": t("to_hub_MPLS-MPLS", "0", 0, 0, 100000, 15),
+                 "c": t("to_hub_INETB-INETB", "0", 0, 4000, 96000, 80), "d": t("to_hub_DEFAULT", "1", 0, 0, 100000, 12)}
+        b = phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
+        b["period"].update(from_ms=0, to_ms=7 * 86400000)
+        m = report.compute(b)
+        ranked = m["sections"]["paths-ranked"]["table"]
+        self.assertEqual(ranked[0]["tunnel"], "to_hub_INETB-INETB")
+        self.assertEqual(ranked[0]["pre_fec_loss_pct"], 0.0)
+        self.assertEqual([r["tunnel"] for r in m["sections"]["paths-fec"]["table"]], ["to_hub_INETA-INETA"])  # 3% before FEC, 0.01% after
+        self.assertEqual(m["metrics"]["paths_fec_masking"]["value"], 1)
+        transports = {r["transport"]: r for r in m["sections"]["paths-transport"]["table"]}
+        self.assertEqual(sorted(transports), ["INETA-INETA", "INETB-INETB", "MPLS-MPLS"])  # underlay paths only
+        self.assertEqual(transports["INETB-INETB"]["outside_thresholds"], 1)
+        self.assertIn("fec_masking", [c["id"] for c in m["sections"]["paths-fec"]["causes"]])
+
+    def test_paths_defaults_to_the_last_7_days_hourly(self):
+        self.assertEqual(report.DEFAULT_PERIOD["paths"], "last-7-days")
+
+
 class HealthByCategoryTests(unittest.TestCase):
     """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
 

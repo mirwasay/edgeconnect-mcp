@@ -31,6 +31,14 @@
     {"id": "fix_or_remove_idle", "text": "Check the idle tunnels that lose probes in the tunnel list; fix the peer or remove the unused path.", "when": [["paths_idle_probe_loss", ">", 0]]}
    ]
   },
+  "paths-fec": {
+   "causes": [
+    {"id": "fec_masking", "text": "The circuit under these paths loses packets; FEC recovers them, so applications see little loss, but it costs extra bandwidth and fails if loss rises further.", "when": [["paths_fec_masking", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "check_masked_circuits", "text": "Check the circuits behind these paths with their carrier: the loss before FEC is the circuit's real quality.", "when": [["paths_fec_masking", ">", 0]]}
+   ]
+  },
   "avail-alarms": {
    "causes": [],
    "actions": [
