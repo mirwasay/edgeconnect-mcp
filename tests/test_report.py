@@ -72,7 +72,8 @@ class ComputeTests(unittest.TestCase):
         listed = [{"applianceId": "1.NE", "severity": "CRITICAL", "description": "Tunnel down"}, {"applianceId": "2.NE", "severity": "MINOR"}]
         m = report.compute(bundle(appliance_alarms=listed))
         self.assertEqual((m["metrics"]["alarms_critical"]["value"], m["metrics"]["alarms_major"]["value"], m["sections"]["avail-alarms"]["status"]), (1, 0, "red"))
-        self.assertEqual(m["sections"]["avail-alarms"]["table"], [{"appliance": "branch-a", "severity": "critical", "description": "Tunnel down"}])
+        self.assertEqual(m["sections"]["avail-alarms"]["table"], [{"appliance": "branch-a", "severity": "critical", "description": "Tunnel down"},
+                                                                  {"appliance": "branch-b<script>", "severity": "minor", "description": ""}])  # every alarm, most severe first
 
     def test_missing_data_is_grey_never_zero_and_listed_as_a_gap(self):
         m = report.compute(bundle(**{"reach:1.NE": [], "reach:2.NE": [], "availability_threshold": {}}))
@@ -369,10 +370,12 @@ class PresentationTests(unittest.TestCase):
         m = report.compute(bundle(appliance_alarms=[{"applianceId": "1.NE", "severity": "CRITICAL"}]))
         self.assertEqual((m["sections"]["avail-alarms"]["status"], m["sections"]["avail-summary"]["status"]), ("red", "amber"))
 
-    def test_tunnels_down_all_period_are_listed_apart_and_left_out_and_the_table_keeps_the_worst_25(self):
+    def test_tunnels_down_all_period_are_counted_or_listed_apart(self):
         overlay = {"1": [{"count": 1000, "tunnel_state": 0, "blackout": 0, "brownout": 0},
                          {"count": 1000, "tunnel_state": 60000, "blackout": 60000, "brownout": 0, "label": "INET", "serviceName": "SSE", "tunnelcount": 2}]}
-        m = report.compute(bundle(**{"overlay:1.NE": overlay}))  # default: include them
+        b = bundle(**{"overlay:1.NE": overlay})
+        b["options"] = {"down_tunnels": "include"}
+        m = report.compute(b)
         self.assertEqual((m["metrics"]["overlay_avail_pct"]["value"], m["metrics"]["tunnel_groups_down_all_period"]["value"]), (50.0, 2))
         self.assertIn("counted in the figures above", " ".join(m["sections"]["avail-tunnels"]["notes"]))
         b = bundle(**{"overlay:1.NE": overlay})
@@ -381,12 +384,6 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual((m["metrics"]["overlay_avail_pct"]["value"], m["metrics"]["tunnel_groups_down_all_period"]["value"]), (100.0, 2))
         self.assertIn("branch-a overlay INET SSE (2 tunnels)", " ".join(m["sections"]["avail-tunnels"]["notes"]))
         self.assertIn("down tunnels: separate (2 down all period and 0 idle tunnels losing probes excluded)", report.render(m))
-        many = [{"nePk": "{}.NE".format(i), "hostName": "s{}".format(i), "state": 1} for i in range(30)]
-        data = {"appliances": many}
-        data.update({"overlay:{}.NE".format(i): {"1": [{"count": 100, "tunnel_state": i, "blackout": 0}]} for i in range(30)})
-        m = report.compute(bundle(**data))
-        self.assertEqual(len(m["sections"]["avail-tunnels"]["table"]), 25)
-        self.assertIn("Worst 25 shown; 6 more rows not shown.", m["sections"]["avail-tunnels"]["notes"])  # 30 overlay rows + the fixture's underlay row
 
     def test_singular_units_status_coloured_bars_and_labelled_axis(self):
         self.assertEqual(report._fmt({"value": 1, "unit": "alarms"}), "1 alarm")
@@ -443,7 +440,9 @@ class ReviewFixTests(unittest.TestCase):
                  "tunnel_2": {"1.NE": {"alias": "to_hub_INET", "overlayid": "0", "SUM_POST_LOSS": 0, "SUM_WRX_PKTS": 100000, "AVG_LATENCY_AVG": 5, "AVG_JITTER": 1, "mos": 440}},
                  "tunnel_3": {"1.NE": {"alias": "to_hub_LTE", "overlayid": "0", "SUM_POST_LOSS": 5000, "SUM_WRX_PKTS": 95000, "AVG_LATENCY_AVG": 90, "AVG_JITTER": 30, "mos": 50}},
                  "bondedTunnel_4": {"1.NE": {"alias": "to_hub_GUEST", "overlayid": "2", "SUM_POST_LOSS": 3433, "SUM_WRX_PKTS": 0, "AVG_LATENCY_AVG": 5, "AVG_JITTER": 1, "mos": 440}}}
-        m = report.compute(bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))
+        b = bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
+        b["options"] = {"down_tunnels": "include"}
+        m = report.compute(b)
         rows = {r["tunnel"]: (r["loss_pct"], r["latency_ms"], r["mos"], r["status"]) for r in m["sections"]["avail-paths"]["table"]}
         self.assertEqual(rows, {"to_hub_DEFAULT": (0.2, 30.0, 4.3, "amber"), "to_hub_INET": (0.0, 5.0, 4.4, "green"), "to_hub_LTE": (5.0, 90.0, 0.5, "red"),
                                 "to_hub_GUEST": (None, 5.0, 4.4, "red")})  # no traffic but probes lost: a broken path, red, not "no data"
@@ -521,9 +520,9 @@ class OptionTests(CollectTests):
         now = datetime(2026, 1, 10, tzinfo=timezone.utc)
         self.assertEqual((report.resolve_month("last-month", now), report.resolve_month("month-to-date", now)), ("2025-12", "2026-01"))
         b = report.collect(self.server(RoutedClient(self.answers()), get_only=True), "lab", "availability", appliances=["branch-a"], now=now, target="99.9")
-        self.assertEqual(b["options"], {"period": "last-month", "month": "2025-12", "scope": ["branch-a"], "target": "99.9", "down_tunnels": "include"})
+        self.assertEqual(b["options"], {"period": "last-month", "month": "2025-12", "scope": ["branch-a"], "target": "99.9", "down_tunnels": "separate"})
         page = report.render(report.compute(b))
-        self.assertIn("Report options: period: last-month (2025-12); scope: branch-a; availability target: 99.9%; down tunnels: include", page)
+        self.assertIn("Report options: period: last-month (2025-12); scope: branch-a; availability target: 99.9%; down tunnels: separate", page)
         self.assertEqual(page.count("Report options:"), 2)  # under the title and in the footer
 
     def test_a_fixed_target_is_met_or_missed(self):
@@ -739,6 +738,7 @@ class ReviewRound3Tests(unittest.TestCase):
         self.assertEqual((row["note"], row["loss_pct"]), ("", 0.02))  # 5,000 packets is plenty for an hour
         month = bundle(health_threshold=THRESHOLDS, **{"paths:1.NE": paths})
         month["period"].update(from_ms=0, to_ms=30 * 86400000)
+        month["options"] = {"down_tunnels": "include"}
         self.assertEqual(report.compute(month)["sections"]["avail-paths"]["table"][0]["note"], "no traffic, probes lost")
 
     def test_last_months_alarms_without_an_archive_are_not_zero(self):
@@ -809,6 +809,68 @@ class ReviewRound4CollectTests(CollectTests):
                            now=datetime(2026, 10, 23, tzinfo=timezone.utc))
         self.assertFalse(b["data"]["period_alarms_covered"])
         self.assertIsNone(report.compute(b)["metrics"]["alarms_critical"]["value"])
+
+
+class CompleteResultsTests(unittest.TestCase):
+    """Reports list every row the scope has (approved 2026-11-09): no worst-N cut in any table."""
+
+    def test_every_table_lists_every_row(self):
+        many = [{"nePk": "{}.NE".format(i), "hostName": "s{}".format(i), "state": 1} for i in range(30)]
+        data = {"appliances": many}
+        data.update({"overlay:{}.NE".format(i): {"1": [{"count": 100, "tunnel_state": i, "blackout": 0}]} for i in range(30)})
+        data["appliance_alarms"] = [{"applianceId": "{}.NE".format(i), "severity": "MAJOR", "description": "d"} for i in range(30)] + [{"applianceId": "1.NE", "severity": "MINOR"}]
+        m = report.compute(bundle(**data))
+        self.assertEqual(len(m["sections"]["avail-tunnels"]["table"]), 31)  # 30 overlay rows + the fixture's underlay row
+        self.assertEqual(len(m["sections"]["avail-alarms"]["table"]), 31)  # every alarm in the period, not the first 15 critical and major
+        self.assertNotIn("not shown", json.dumps(m))
+
+    def test_noc_lists_every_active_alarm_tunnel_down_and_site(self):
+        many = [{"nePk": "{}.NE".format(i), "hostName": "s{}".format(i), "state": 2} for i in range(40)]
+        tunnels = {"{}.NE".format(i): {"t": {"operStatus": "Down", "alias": "x"}} for i in range(40)}
+        alarms = [{"applianceId": "{}.NE".format(i), "severity": "MINOR"} for i in range(40)]
+        m = report.compute(phase2_bundle("noc", appliances=many, tunnels_physical=tunnels, tunnels_bonded={}, active_alarms=alarms))
+        self.assertEqual([len(m["sections"][s]["table"]) for s in ("noc-alarms", "noc-tunnels", "noc-worst")], [40, 40, 40])
+
+    def test_capacity_rows_are_all_listed(self):
+        totals = [{"nePk": "1.NE", "INTERFACE": "wan{}".format(i), "TRAFFIC_TYPE": 4, "SUM_TX_BYTES": 1, "AVG_MAX_BW_TX": 1000, "AVG_MAX_BW_RX": 1000} for i in range(35)]
+        m = report.compute(phase2_bundle("capacity", interface_totals=totals))
+        self.assertEqual(len(m["sections"]["cap-links"]["table"]), 35)
+
+    def test_idle_and_dead_tunnels_are_listed_apart_by_default(self):
+        overlay = {"1": [{"count": 1000, "tunnel_state": 0, "blackout": 0, "brownout": 0},
+                         {"count": 1000, "tunnel_state": 60000, "blackout": 60000, "brownout": 0, "label": "INET", "tunnelcount": 2}]}
+        m = report.compute(bundle(**{"overlay:1.NE": overlay}))
+        self.assertEqual(m["metrics"]["overlay_avail_pct"]["value"], 100.0)
+        self.assertEqual(report.DEFAULT_OPTIONS["down_tunnels"], "separate")
+
+
+class HealthByCategoryTests(unittest.TestCase):
+    """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
+
+    @staticmethod
+    def hours(status, n=24):
+        return [{"status": status, "time": NOW - 3600 * (h + 1)} for h in range(n)]
+
+    def test_each_category_has_its_own_share_and_a_lone_bad_category_is_named(self):
+        per = {"ALARM": "HEALTHY", "LOSS": "HEALTHY", "LATENCY": "HEALTHY", "JITTER": "HEALTHY", "MOS": "MAJOR", "BW_UTILIZATION": None}
+        data = {"health:" + cat: {"1.NE": self.hours(s), "2.NE": self.hours(s)} for cat, s in per.items()}
+        m = report.compute(phase2_bundle("noc", **data))
+        v = lambda k: m["metrics"][k]["value"]
+        self.assertEqual((v("health_loss_good_24h_pct"), v("health_mos_good_24h_pct"), v("health_good_24h_pct")), (100.0, 0.0, 0.0))
+        self.assertIsNone(v("health_bw_utilization_good_24h_pct"))  # no statuses at all: no data, not 0
+        notes = " ".join(m["sections"]["noc-health"]["notes"])
+        self.assertIn("Only MOS is unhealthy", notes)
+        row = m["sections"]["noc-health"]["table"][0]
+        self.assertEqual((row["appliance"], row["loss"], row["mos"]), ("branch-a", 100.0, 0.0))
+
+    def test_collect_reads_health_once_per_category(self):
+        client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(SPEC))
+            orchestrator = Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)
+            report.collect(Server({"lab": orchestrator}, default="lab", log=lambda line: None), "lab", "noc", now=datetime(2026, 9, 21, tzinfo=timezone.utc))
+        self.assertEqual([c[3]["verticals"] for c in client.calls if c[1] == "/health"], [[v] for v in report.HEALTH_VERTICALS])
 
 
 if __name__ == "__main__":
