@@ -78,7 +78,7 @@
   },
   "noc-health": {
    "causes": [
-    {"id": "mos_threshold", "text": "MOS is rated unhealthy almost everywhere while loss, latency and jitter are healthy: the MOS health threshold setting is the likely cause, not the network.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 95], ["health_latency_good_24h_pct", ">=", 95], ["health_jitter_good_24h_pct", ">=", 95]]},
+    {"id": "mos_threshold", "text": "MOS is rated unhealthy almost everywhere while loss, latency and jitter are healthy: the MOS health threshold setting is the likely cause, not the network.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 90], ["health_latency_good_24h_pct", ">=", 90], ["health_jitter_good_24h_pct", ">=", 90]]},
     {"id": "standing_alarms", "text": "Standing alarms rate every hour as unhealthy until they are cleared, even when traffic is fine.", "when": [["health_alarm_good_24h_pct", "<", 50]]},
     {"id": "path_loss", "text": "Loss outside the threshold on some paths in the last 24 hours.", "when": [["health_loss_good_24h_pct", "<", 95]]}
    ],

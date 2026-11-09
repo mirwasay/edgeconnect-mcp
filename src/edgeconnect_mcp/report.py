@@ -837,13 +837,14 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         total_reach, total_samples = total_reach + reach, total_samples + samples
         rows.append({"appliance": name, "nePk": ne, "reachability_pct": pct, "status": band(pct, limits)})
     fleet = _pct(total_reach, total_samples)
-    m_fleet = metric("fleet_reach_pct", fleet, "%", "Fleet appliance reachability", band(fleet, limits))
+    m_fleet = metric("fleet_reach_pct", fleet, "%", "Appliance reachability, average over the period", band(fleet, limits))
     below = [r for r in rows if r["status"] in ("amber", "red")]
     m_below = metric("appliances_below_target", len(below) if fleet is not None else None, "appliances", "Appliances below the reachability target")
     m_measured = metric("appliances_measured", sum(1 for r in rows if r["reachability_pct"] is not None), "appliances", "Appliances with reachability data")
     metric("reach_target_pct", max(limits), "%", "Reachability target")
     rows.sort(key=lambda r: (r["reachability_pct"] is None, r["reachability_pct"] if r["reachability_pct"] is not None else 0))
-    sections["avail-appliances"] = {"status": metrics[m_fleet]["status"], "metrics": [m_fleet, m_below, m_measured, "reach_target_pct"],
+    sections["avail-appliances"] = {"status": worst([metrics[m_fleet]["status"]] + [r["status"] for r in below]), "metrics": [m_fleet, m_below, m_measured, "reach_target_pct"],
+                                    "notes": ["Rule: the worse of the fleet average and the worst appliance against the reachability target."],
                                     "table": rows, "chart": {"title": "Lowest appliance reachability, % of the month", "zoom": True,
                                                              "points": [(r["appliance"], r["reachability_pct"], r["status"]) for r in rows if r["reachability_pct"] is not None][:25]}}
 
@@ -906,7 +907,9 @@ def _availability(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     have_alarms = covered and (isinstance(listed, list) or any(("alarm_period:" + str(ne)) in data for ne in names))
     alarm_status = "grey" if not have_alarms else "red" if counts["CRITICAL"] else "amber" if counts["MAJOR"] else "green"
     alarm_ids = [metric("alarms_" + sev.lower(), counts[sev] if have_alarms else None, "alarms", sev.title() + " alarms in the period") for sev in counts]
-    sections["avail-alarms"] = {"status": alarm_status, "metrics": alarm_ids, "table": alarm_rows, "notes": ["Source: " + source + "."]}
+    sections["avail-alarms"] = {"status": alarm_status, "metrics": alarm_ids, "table": alarm_rows, "notes": ["Source: " + source + "."] + (
+        ["The counts are not shown: the Orchestrator keeps 7 days of alarms, which do not cover the period. The table lists only the alarms it still holds "
+         "(the last 7 days and those still open), not every alarm of the period."] if not covered and alarm_rows else [])}
 
     # Interfaces: like tunnels, `count` is minute samples and `state` is seconds down (9.7.1, 10.0).
     if_limits = _target_limits(ctx, "interfaceAvailability" if "interfaceAvailability" in threshold else "reachability")
@@ -1021,13 +1024,15 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
         # No loss figure (nothing received) means the path was not measured: no data, not good, whatever its probes say.
         row["status"] = "red" if row["note"] else "grey" if row["loss_pct"] is None else worst([b for b, _, _ in bands])
         row["why"] = "" if row["note"] or row["status"] in ("green", "grey") else ", ".join("{} {}".format(word, text) for b, word, text in bands if b == row["status"])
-    rows.sort(key=lambda r: (-("green", "grey", "amber", "red").index(r["status"]), -(r["loss_pct"] or 0), -(r["latency_ms"] or 0)))
+    rows.sort(key=lambda r: (-("grey", "green", "amber", "red").index(r["status"]), -(r["loss_pct"] or 0), -(r["latency_ms"] or 0)))  # no data last
     red, amber = sum(r["status"] == "red" for r in rows), sum(r["status"] == "amber" for r in rows)
     no_data = sum(r["status"] == "grey" for r in rows)
     idle = sum(1 for r in rows if r["note"]) + len(broken)
     notes = ["Each tunnel graded on loss after FEC, latency, jitter and MOS against the Orchestrator's health thresholds: loss {} / {} %, latency {} / {} ms, jitter {} / {} ms, MOS {} / {}.".format(
         *(limits["packetLoss"] + limits["latency"] + limits["jitter"] + limits["mos"])),
-             "Why: the measures outside the threshold that set the row's status. A tunnel that received no packets has no loss figure and is shown as No data."]
+             "Why: the measures outside the threshold that set the row's status. A tunnel that received no packets has no loss figure and is shown as No data.",
+             "{:,} listed = {:,} within the thresholds + {:,} between + {:,} outside + {:,} with no data.".format(
+                 len(rows), sum(r["status"] == "green" for r in rows), amber, red, no_data)]
     if broken:
         notes.append("Under {} packets received in the period a loss % means little: tunnels with no traffic that lost probes (usually a broken path or a dead "
                      "configuration) are left out of the status and the figures, and listed at the end of this section.".format(floor))
@@ -1041,7 +1046,8 @@ def _paths(ctx: Dict[str, Any]) -> Dict[str, Any]:
                 r.pop(column, None)
     return {"status": worst([r["status"] for r in rows]), "table": rows, "notes": notes,
             "apart": {"title": "Listed apart: tunnels with no traffic that lost probes", "rows": apart},
-            "metrics": [metric("paths_measured", len(rows), "tunnels", "Tunnels graded"),
+            "metrics": [metric("paths_measured", len(rows), "tunnels", "Tunnels listed"),
+                        metric("paths_graded", len(rows) - no_data, "tunnels", "Tunnels graded (with packets received)"),
                         metric("paths_red", red, "tunnels", "Tunnels outside the health thresholds", "red" if red else "green"),
                         metric("paths_amber", amber, "tunnels", "Tunnels between the health thresholds", "amber" if amber else "green"),
                         metric("paths_no_data", no_data, "tunnels", "Tunnels with no packets received (no data)"),
@@ -1110,7 +1116,7 @@ def _path_report(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     sections["paths-dscp"] = {"status": "green" if dscp_rows else "grey", "metrics": [], "table": dscp_rows,
                               "notes": ["WAN bytes by DSCP marking, all traffic. Voice is usually ef (46); video af41 (34)."]}
     sections["paths-summary"] = {"status": worst([ranked["status"], sections["paths-fec"]["status"]]),
-                                 "metrics": [m for m in ("paths_ok_pct", "paths_measured", "paths_red", "paths_amber", "paths_no_data", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
+                                 "metrics": [m for m in ("paths_ok_pct", "paths_graded", "paths_red", "paths_amber", "paths_no_data", "paths_fec_masking", "paths_idle_probe_loss") if m in ctx["metrics"]]}
     return sections
 
 
@@ -1175,8 +1181,14 @@ def _optimisation(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             rows.append({"appliance": name, "lan_bytes": int(lan), "wan_bytes": int(wan), "saved_bytes": int(lan - wan), "reduction_pct": _pct(lan - wan, lan)})
     rows.sort(key=lambda r: -r["saved_bytes"])
     lan, wan = sum(r["lan_bytes"] for r in rows), sum(r["wan_bytes"] for r in rows)
+    saved_total = sum(max(0, r["saved_bytes"]) for r in rows)
+    top2 = _pct(sum(max(0, r["saved_bytes"]) for r in rows[:2]), saved_total) if saved_total else None
+    listed = {r["appliance"] for r in rows}
+    absent = sorted(str(n) for n in names.values() if n not in listed)
     status = "green" if rows else "grey"
     ids = [metric("opt_reduction_pct", _pct(lan - wan, lan), "%", "Reduction of optimised traffic"), metric("opt_saved_bytes", lan - wan if rows else None, "bytes", "WAN bytes saved"),
+           metric("opt_top2_share_pct", top2, "%", "Share of the bytes saved that comes from the 2 appliances saving most"),
+           metric("opt_appliances_saving", sum(1 for r in rows if (r["reduction_pct"] or 0) >= 1), "appliances", "Appliances reducing optimised traffic by 1% or more"),
            metric("opt_lan_bytes", lan if rows else None, "bytes", "Optimised traffic before reduction")]
     apps: Dict[str, List[float]] = {}
     for ne in names:
@@ -1190,13 +1202,17 @@ def _optimisation(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     boost = [{"appliance": names.get(r.get("nePk"), r.get("nePk")), "boost_configured_kbps": r.get("configured"), "boosted_bytes": r.get("boost_bytes"),
               "seconds_not_boosted": r.get("seconds_not_boosted")} for ne in names for r in (data.get("boost:" + str(ne)) or []) if isinstance(r, dict)]
     extra = {"opt-apps": {"status": "green" if app_rows else "grey", "metrics": [], "table": app_rows,
-                          "notes": ["LAN bytes against WAN bytes per application, all traffic types; pass-through traffic shows no reduction."]},
+                          "notes": ["LAN bytes against WAN bytes per application, all traffic types, so its totals are larger than the optimised-traffic figures above and do not "
+                                    "add up to them; pass-through traffic shows no reduction. A negative saving means the WAN side was larger than the LAN side "
+                                    "(tunnel and FEC overhead on traffic that cannot be reduced)."]},
              "opt-boost": {"status": "green" if boost else "grey", "metrics": [], "table": boost,
                            "notes": ["Boost adds bandwidth to chosen traffic above the appliance's licensed rate. Configured: the Boost rate set (kbps); boosted: bytes sent with Boost; "
                                      "seconds not boosted: time when traffic wanted Boost and none was left."] if boost else ["No Boost data: Boost is not licensed or not used on these appliances."]}}
     return dict(extra, **{"opt-summary": {"status": status, "metrics": ids},
             "opt-appliances": {"status": status, "metrics": [], "table": rows, "notes": ["Optimised traffic only (GET /stats/aggregate/flow, trafficType optimized_traffic): "
-                                                                                    "LAN bytes in and out against WAN bytes out and in. Pass-through traffic is not reduced and is left out."],
+                                                                                    "LAN bytes in and out against WAN bytes out and in. Pass-through traffic is not reduced and is left out.",
+                                                                                    "Status: Good means the figures were read; there is no target for reduction."]
+                               + (["{} appliances have no optimised-traffic figures and are not in the table: {}.".format(len(absent), ", ".join(absent))] if absent else []),
                                "chart": {"title": "Reduction by appliance, % (largest 15 by bytes saved)", "zoom": False,
                                          "points": [(r["appliance"], r["reduction_pct"]) for r in rows[:15] if r["reduction_pct"] is not None]}}})
 
@@ -1216,17 +1232,24 @@ def _security(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                     p[key] += float(row.get(field) or 0)
     rows = [{"from_zone": a, "to_zone": b, "flows_allowed": int(v["allowed"]), "flows_dropped": int(v["dropped"]), "dropped_pct": _pct(v["dropped"], v["allowed"] + v["dropped"]),
              "policy_drop_packets": int(v["policy"]), "routing_drop_packets": int(v["routing"])} for (a, b), v in pairs.items()]
-    for r in rows:  # every flow dropped: a rule that blocks the pair outright, which should be checked as intended
-        r["status"] = "amber" if r["flows_dropped"] and not r["flows_allowed"] else "green" if r["flows_allowed"] + r["flows_dropped"] else "grey"
+    for r in rows:  # every flow dropped (blocked outright), or a heavy share dropped: check the rule is meant
+        heavy = r["flows_dropped"] >= 1000 and (r["dropped_pct"] or 0) >= 10
+        r["status"] = "amber" if (r["flows_dropped"] and not r["flows_allowed"]) or heavy else "green" if r["flows_allowed"] + r["flows_dropped"] else "grey"
     rows.sort(key=lambda r: (r["status"] != "amber", -r["flows_dropped"], r["from_zone"], r["to_zone"]))
+    missing = sorted({z for r in rows for z in (r["from_zone"], r["to_zone"]) if z.endswith("(not in the zone list)")})
+    unknown = ["Zones seen in traffic but not defined in the Orchestrator's zone list: {}. Check the zone configuration on the appliances that use them.".format(
+        ", ".join(z.replace(" (not in the zone list)", "") for z in missing))] if missing else []
     blocked = sum(r["status"] == "amber" for r in rows)
     status = "grey" if not rows else "amber" if blocked else "green"
     ids = [metric("sec_flows_dropped", sum(r["flows_dropped"] for r in rows) if rows else None, "flows", "Flows dropped by the firewall"),
            metric("sec_flows_allowed", sum(r["flows_allowed"] for r in rows) if rows else None, "flows", "Flows allowed"),
-           metric("sec_zone_pairs", len(rows), "zone pairs", "Zone pairs with traffic"),
+           metric("sec_zone_pairs", sum(r["status"] != "grey" for r in rows), "zone pairs", "Zone pairs with traffic"),
+           metric("sec_dropped_pct", _pct(sum(r["flows_dropped"] for r in rows), sum(r["flows_allowed"] + r["flows_dropped"] for r in rows)) if rows else None, "%",
+                  "Share of flows dropped"),
            metric("sec_pairs_all_dropped", blocked if rows else None, "zone pairs", "Zone pairs with every flow dropped", "amber" if blocked else "green" if rows else None)]
     return {"sec-summary": {"status": status, "metrics": ids},
-            "sec-pairs": {"status": status, "metrics": [], "table": rows, "notes": ["Rule: a zone pair whose every flow was dropped is a warning: confirm the pair is meant to be blocked. Those pairs are listed first.",
+            "sec-pairs": {"status": status, "metrics": [], "table": rows, "notes": ["Rule: a zone pair whose every flow was dropped, or that dropped at least 10% of its flows and at least 1,000 flows, is a warning: confirm "
+                                                                       "the rule is meant. Those pairs are listed first."] + unknown + [
                                                                        "Policy drops are flows denied by a firewall rule; routing drops are packets with no route."]}}
 
 
@@ -1261,34 +1284,46 @@ def _activity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         repeat[(a.get("applianceId"), name)] = repeat.get((a.get("applianceId"), name), 0) + 1
     type_rows = [{"alarm": n, "severity": sev, "times": k} for (n, sev), k in sorted(by_type.items(), key=lambda i: (SEVERITY_ORDER.get(i[0][1], 9), -i[1]))]
     repeat_rows = [{"appliance": names.get(ne, ne), "alarm": n, "times": k} for (ne, n), k in sorted(repeat.items(), key=lambda i: -i[1]) if k >= 3]
-    changes_by_ne: Dict[Any, List[Tuple[int, str]]] = {}
-    for r in audit or []:
-        changes_by_ne.setdefault(r.get("nepk"), []).append((int(r.get("queuedTime") or 0), str(r.get("name") or "")))
+    changes_by_ne: Dict[Any, List[Tuple[int, str, str]]] = {}
+    for r in audit or []:  # people's changes only: automation runs every few seconds, so every alarm would follow one
+        if not AUTOMATION_USER.search(str(r.get("user") or "")):
+            changes_by_ne.setdefault(r.get("nepk"), []).append((int(r.get("queuedTime") or 0), str(r.get("name") or ""), str(r.get("user") or "")))
     for times in changes_by_ne.values():
         times.sort()
     after = []
     for a in alarms:  # raised within an hour after a change on the same appliance (the latest such change is named)
         raised = int(a.get("timeOccurredInMills") or 0)
         times = changes_by_ne.get(a.get("applianceId"), [])
-        i = bisect.bisect_right(times, (raised, "\uffff")) - 1
+        i = bisect.bisect_right(times, (raised, "\uffff", "\uffff")) - 1
         if i >= 0 and raised - times[i][0] <= 3600000:
-            after.append({"appliance": names.get(a.get("applianceId")), "alarm": str(a.get("name") or ""), "raised": _when(raised), "after_change": times[i][1]})
+            after.append({"appliance": names.get(a.get("applianceId")), "alarm": str(a.get("name") or ""), "raised": _when(raised), "after_change": times[i][1],
+                          "changed_by": times[i][2], "minutes_after": round((raised - times[i][0]) / 60000.0, 1)})
+    after.sort(key=lambda r: (r["raised"], str(r["appliance"])))
     to_clear = sorted((a["clearedTimeInMills"] - a["timeOccurredInMills"]) / 60000.0 for a in alarms
                       if isinstance(a.get("clearedTimeInMills"), (int, float)) and a["clearedTimeInMills"] > 0 and isinstance(a.get("timeOccurredInMills"), (int, float)))
     failed = sum(r["failed"] for r in changes)
+    # a change type that failed at least half of 100 or more attempts is a loop that is not working, not an odd failure
+    looping = [r for r in changes if r["times"] >= 100 and r["failed"] * 2 >= r["times"]]
     ids = [metric("act_changes", sum(r["times"] for r in changes) if audit is not None else None, "changes", "Changes in the audit log"),
-           metric("act_changes_failed", failed if audit is not None else None, "changes", "Changes that failed", "amber" if failed else "green"),
+           metric("act_changes_failed", failed if audit is not None else None, "changes", "Changes that failed", "red" if looping else "amber" if failed else "green"),
            metric("act_alarms", len(alarms), "alarms", "Alarms raised"), metric("act_repeat", len(repeat_rows), "pairs", "Appliance and alarm pairs raised 3 or more times"),
            metric("act_median_clear_min", round(statistics.median(to_clear), 1) if to_clear else None, "minutes", "Median time to clear (cleared alarms only)")]
-    return {"act-summary": {"status": "amber" if failed or repeat_rows else "green", "metrics": ids},
-            "act-changes": {"status": "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes,
-                            "notes": ["Changes grouped by user and type, those with failures first; system users such as OverlayManager are the Orchestrator's own automation."]},
+    return {"act-summary": {"status": "red" if looping else "amber" if failed or repeat_rows else "green", "metrics": ids},
+            "act-changes": {"status": "red" if looping else "amber" if failed else "green" if audit is not None else "grey", "metrics": [], "table": changes,
+                            "notes": ["Changes grouped by user and type, those with failures first; system users such as OverlayManager are the Orchestrator's own automation.",
+                                      "Rule: any failure is a warning; a change type that failed at least half of 100 or more attempts is critical (a retry loop that is not working)."]},
             "act-alarms": {"status": "grey" if not type_rows else "red" if any(r["severity"] == "critical" for r in type_rows)
                            else "amber" if any(r["severity"] == "major" for r in type_rows) else "green", "metrics": [], "table": type_rows,
                            "notes": ["Rule: the worst severity raised sets the status (critical red, major amber)."]},
             "act-repeat": {"status": "amber" if repeat_rows else "green", "metrics": [], "table": repeat_rows, "notes": ["An alarm raised 3 or more times on one appliance in the window."]},
             "act-after-change": {"status": "amber" if after else "green", "metrics": [], "table": after,
-                                 "notes": ["Alarms raised within an hour after a change on the same appliance. Timing only: it does not show that the change caused the alarm."]}}
+                                 "notes": ["Alarms raised within an hour after a change made by a person on the same appliance, oldest first. The Orchestrator's own automation "
+                                           "changes appliances every few seconds, so its changes are not used here. Timing only: it does not show that the change caused the alarm."]}}
+
+
+# Audit-log users that are the Orchestrator's own automation (seteam 10.0: OverlayManager, Cluster Applier, System, Orchestration,
+# ZscalerConfigManager, AwsGetArtifactsJob, LicenseUtil, IdsIps:: SignatureDownloaderJob). Anyone else is a person.
+AUTOMATION_USER = re.compile(r"(?i)manager|applier|^system$|orchestration|job\b|util\b|::")
 
 
 def _when(ms: Any) -> str:
@@ -1330,6 +1365,9 @@ def _incident(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     alarms.sort(key=lambda a: (SEVERITY_ORDER.get(str(a.get("severity")).lower(), len(SEVERITY_ORDER)), not start <= (a.get("timeOccurredInMills") or 0) <= end,
                                a.get("timeOccurredInMills") or 0))
     counts = {sev: sum(1 for a in alarms if str(a.get("severity")).upper() == sev) for sev in ("CRITICAL", "MAJOR", "MINOR", "WARNING")}
+    raised_in = [a for a in alarms if start <= (a.get("timeOccurredInMills") or 0) <= end]
+    new_counts = {sev: sum(1 for a in raised_in if str(a.get("severity")).upper() == sev) for sev in counts}
+    cleared_later = sum(1 for a in alarms if (a.get("clearedTimeInMills") or 0) > end)
     to_clear = sorted((a["clearedTimeInMills"] - a["timeOccurredInMills"]) / 60000.0 for a in alarms
                       if isinstance(a.get("clearedTimeInMills"), (int, float)) and a["clearedTimeInMills"] > 0 and isinstance(a.get("timeOccurredInMills"), (int, float)))
     still_open = None if get_only_list else sum(1 for a in alarms if not a.get("clearedTimeInMills") or a["clearedTimeInMills"] > end)
@@ -1338,16 +1376,21 @@ def _incident(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
              "cleared": _when(a.get("clearedTimeInMills")) or ("closed, time not given" if a.get("closed") else "open"), "minutes_to_clear": round((a["clearedTimeInMills"] - a["timeOccurredInMills"]) / 60000.0, 1)
              if a.get("clearedTimeInMills") and a.get("timeOccurredInMills") else None} for a in alarms]
     read = data.get("incident_alarm_source") not in (None, "none") or bool(data.get("incident_alarms"))
-    alarm_status = "grey" if not read else "red" if counts["CRITICAL"] else "amber" if counts["MAJOR"] else "green"
+    # The incident is what was raised in the window; alarms already open before it are listed but do not set the status.
+    alarm_status = "grey" if not read else "red" if new_counts["CRITICAL"] else "amber" if new_counts["MAJOR"] else "green"
     sections: Dict[str, Dict[str, Any]] = {}
     sections["inc-timeline"] = {"status": alarm_status, "table": rows,
                                 "metrics": [metric("inc_alarms", len(alarms), "alarms", "Alarms open in the window"),
+                                            metric("inc_raised_in_window", len(raised_in), "alarms", "Raised in the window", alarm_status if read else None),
+                                            metric("inc_already_open", len(alarms) - len(raised_in), "alarms", "Already open before the window"),
                                             metric("inc_critical", counts["CRITICAL"], "alarms", "Critical alarms"), metric("inc_major", counts["MAJOR"], "alarms", "Major alarms"),
-                                            metric("inc_open_at_end", still_open, "alarms", "Still open at the end of the window"),
+                                            metric("inc_open_at_end", still_open, "alarms", "Still open at the end of the window" +
+                                                   (" ({:,} cleared after it)".format(cleared_later) if cleared_later and still_open is not None else "")),
                                             metric("inc_median_clear_min", round(statistics.median(to_clear), 1) if to_clear else None, "minutes",
                                                    "Median time to clear (cleared alarms only{})".format(", {:,} of them".format(len(to_clear)) if to_clear else "")),
                                             metric("inc_max_clear_min", round(to_clear[-1], 1) if to_clear else None, "minutes", "Longest time to clear (cleared alarms only)")],
-                                "notes": ["Every alarm open at any time in the window, worst severity first; within a severity, those raised in the window first, then those already open, oldest first."]}
+                                "notes": ["Every alarm open at any time in the window, worst severity first; within a severity, those raised in the window first, then those already open, oldest first.",
+                                          "Rule: the worst severity raised in the window (critical red, major amber); alarms already open before it are listed but do not set the status."]}
     # Reachability of each affected appliance inside the window, from the minute samples.
     limits = _target_limits(ctx, "reachability")
     app_rows = []
@@ -1395,11 +1438,13 @@ def _incident(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                                           "result": "failed" if _failed(r) else "ok"} for r in changes][-40:],
                                "metrics": [metric("inc_changes_before", n_before, "changes", "Changes in the 24 hours before"),
                                            metric("inc_changes_during", n_during, "changes", "Changes during the window"),
-                                           metric("inc_changes_failed", failed_changes, "changes", "Changes that failed (in the part of the log read)", "amber" if failed_changes else "green")],
+                                           metric("inc_changes_failed", failed_changes, "changes", "Changes that failed (in the part of the log read)", "amber" if failed_changes else "green"),
+                                           metric("inc_changes_read", len(changes), "changes", "Changes read from the audit log" + (
+                                               " (from {} UTC only: the log hit its limit)".format(_when(reached)) if full and reached else ""))],
                                "notes": ["Shown next to the alarms so a reader can compare times; the report does not say whether any change caused the incident. Newest 40 shown.",
                                          "Rule: a failed change is a warning; a cut audit log with none failed is No data (the counts are not shown because they would be low)."]}
     sections["inc-summary"] = {"status": worst([alarm_status, sections["inc-appliances"]["status"], sections["inc-paths"]["status"]]),
-                               "metrics": ["inc_alarms", "inc_critical", "inc_affected", "inc_open_at_end", "inc_changes_before", "inc_changes_during"],
+                               "metrics": ["inc_raised_in_window", "inc_already_open", "inc_affected", "inc_open_at_end", "inc_changes_read", "inc_changes_failed"],
                                "notes": ["Window {} to {} UTC{}.".format(_when(start), _when(end), " (around alarm {})".format(inc["alarm_id"]) if inc.get("alarm_id") else "")]}
     return sections
 
@@ -1429,6 +1474,7 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     active = data.get("active_alarms")
     if isinstance(active, list) and len(active) >= MAX_ALARMS:
         gaps.append("Active alarms: the list reached the {}-alarm cap, so the counts may be low.".format(MAX_ALARMS))
+    grouped: Dict[Tuple[Any, str, str], Dict[str, Any]] = {}
     if isinstance(active, list):
         for alarm in active:
             sev = str(alarm.get("severity") or "").lower()
@@ -1436,10 +1482,15 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 sev_counts[sev] += 1
                 per_ne.setdefault(alarm.get("applianceId"), {}).setdefault(sev, 0)
                 per_ne[alarm.get("applianceId")][sev] += 1
-            if sev:
-                since = alarm.get("timeOccurredInMills")
-                rows.append({"appliance": names.get(alarm.get("applianceId"), alarm.get("applianceId")), "severity": sev, "description": str(alarm.get("description") or "")[:160],
-                             "since": datetime.fromtimestamp(since / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M") if isinstance(since, (int, float)) else ""})
+            if sev:  # the same alarm on the same appliance (one per tunnel, say) is one row with a count, dated by the oldest
+                since = alarm.get("timeOccurredInMills") if isinstance(alarm.get("timeOccurredInMills"), (int, float)) else None
+                key = (names.get(alarm.get("applianceId"), alarm.get("applianceId")), sev, str(alarm.get("description") or "")[:160])
+                g = grouped.setdefault(key, {"count": 0, "since": None})
+                g["count"] += 1
+                g["since"] = since if g["since"] is None or (since is not None and since < g["since"]) else g["since"]
+        rows = [{"appliance": a, "severity": sev, "description": d, "count": g["count"],
+                 "since": datetime.fromtimestamp(g["since"] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M") if g["since"] else "",
+                 "open_days": int((now_s - g["since"] / 1000) // 86400) if g["since"] else None} for (a, sev, d), g in grouped.items()]
         rows.sort(key=lambda r: (SEVERITY_ORDER.get(r["severity"], len(SEVERITY_ORDER)), r["since"] or "9"))  # oldest first within a severity
         source = "POST /alarm/appliance (active)"
     else:
@@ -1460,7 +1511,8 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         source = "GET /alarm/summary and GET /alarm/count/appliance (counts only; the alarm list needs the read POST)"
     alarm_status = "grey" if sev_counts["critical"] is None else "red" if sev_counts["critical"] else "amber" if sev_counts["major"] else "green"
     retention = (data.get("alarm_retention") or {}).get("historical_appliance_alarm", {}).get("retention") if isinstance(data.get("alarm_retention"), dict) else None
-    notes = ["Source: " + source + "."]
+    notes = ["Source: " + source + "."] + (["Count: the same alarm open more than once on one appliance (for example one per tunnel); Since: the oldest of them; "
+                                           "Open days: how long it has been open."] if isinstance(active, list) else [])
     if isinstance(retention, (int, float)):
         notes.append("This Orchestrator keeps {:g} days of alarm history.".format(retention / 86400))
     sections["noc-alarms"] = {"status": alarm_status, "notes": notes, "table": rows,
@@ -1473,7 +1525,7 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     # same rule as the mos_threshold card): MOS stays in its own row but is left out of the headline share, which says so.
     day = {v: _good_share(value, names, now_s - 86400)["all"] for v, value in per_category.items()}
     network = [day.get(v) for v in ("LOSS", "LATENCY", "JITTER") if day.get(v) is not None]
-    setting = ["MOS"] if day.get("MOS") is not None and day["MOS"] < 50 and network and min(network) >= 95 else []
+    setting = ["MOS"] if day.get("MOS") is not None and day["MOS"] < 50 and network and min(network) >= 90 else []
     health = _combine_health({v: value for v, value in per_category.items() if v not in setting}) if per_category else data.get("health")  # "health": bundles from before 0.4.3
     health_ids, health_status, seen = [], "grey", set()
     bad_hours: Dict[Any, int] = {}
@@ -1510,9 +1562,19 @@ def _noc(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             row: Dict[str, Any] = {"appliance": name}
             for v in per_category:
                 pct = shares[v]["24h"]["by_ne"].get(ne)
-                row[_cap(HEALTH_LABELS[v])] = {"value": pct, "text": "no data" if pct is None else "{:.0f}%".format(pct), "status": band(pct, (95.0, 99.0))}
+                row[_cap(HEALTH_LABELS[v]) + (" (not counted)" if v in setting else "")] = {"value": pct, "text": "no data" if pct is None else "{:.0f}%".format(pct),
+                                                                                             "status": band(pct, (95.0, 99.0))}
             table.append(row)
-        table.sort(key=lambda r: (min([c["value"] for k, c in r.items() if k != "appliance" and c["value"] is not None], default=101), str(r["appliance"])))
+        ranked = lambda r: [c for k, c in r.items() if k != "appliance" and not k.endswith(" (not counted)")]
+        for v in per_category:
+            if shares[v]["24h"]["all"] is None:
+                gaps.append("Health: the Orchestrator rated no appliance on {} in the last 24 hours, so that column is empty.".format(HEALTH_LABELS[v]))
+        unrated = [name for ne, name in names.items() if all(shares[v]["24h"]["by_ne"].get(ne) is None for v in ("LOSS", "LATENCY", "JITTER") if v in shares)]
+        if unrated and any(v in shares for v in ("LOSS", "LATENCY", "JITTER")):
+            gaps.append("Health: {} appliances have no loss, latency or jitter rating in the last 24 hours (usually unreachable or not reporting statistics): {}.".format(
+                len(unrated), ", ".join(sorted(map(str, unrated)))))
+        table.sort(key=lambda r: (-sum(c["status"] == "red" for c in ranked(r)), -sum(c["status"] == "amber" for c in ranked(r)),
+                                  min([c["value"] for c in ranked(r) if c["value"] is not None], default=101), str(r["appliance"])))
         if setting:
             notes.append("MOS is unhealthy in most hours while loss, latency and jitter are healthy: check the MOS health thresholds (GET /health/healthThresholdConfig) "
                          "against the measured MOS before treating this as a network problem. MOS is left out of the headline figure.")
@@ -1752,6 +1814,11 @@ def _drivers(rows: Any, count: int = 3) -> str:
     return ", ".join("{} {:.0f}%".format(r.get("APPNAME"), 100.0 * _wan(r, "SUM_WTX_BYTES", "SUM_WRX_BYTES") / total) for r in named) if total else ""
 
 
+def _bandwidth_note(link: Mapping[str, Any]) -> str:
+    """A configured rate under 1 Mbps (seteam: 0.30 Mbps on a busy-looking link) makes the utilisation % meaningless."""
+    return "check the configured bandwidth (under 1 Mbps)" if 0 < min(float(link.get("bw_tx") or 0), float(link.get("bw_rx") or 0)) < 1000 else ""
+
+
 def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     data, names, metric, gaps = ctx["data"], ctx["names"], ctx["metric"], ctx["gaps"]
     links = wan_links(data, names)
@@ -1788,10 +1855,14 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                      "avg_out_pct": link["avg_tx_pct"], "avg_in_pct": link["avg_rx_pct"], "p95_out_pct": p95_tx, "p95_in_pct": p95_rx,
                      "buckets": max(len(tx), len(rx)), "peak_hour_utc": "{:02d}:00".format(peak_hour) if peak_hour is not None else None,
                      "avg_change_pts": round(now_avg - before[(link["nePk"], link["interface"])], 2) if (link["nePk"], link["interface"]) in before else None,
-                     "top_applications": _drivers(data.get("apps:" + str(link["nePk"]))) if status in ("amber", "red") else "", "status": status})
-    if not any(r["top_applications"] for r in rows):  # filled only for links at or above the limit
-        for r in rows:
-            r.pop("top_applications")
+                     "top_applications": _drivers(data.get("apps:" + str(link["nePk"]))) if status in ("amber", "red") else "", "check": _bandwidth_note(link), "status": status})
+    for column in ("top_applications", "check", "label"):  # columns that are empty on every row are left out
+        if not any(r[column] for r in rows):
+            for r in rows:
+                r.pop(column)
+    unmeasured = ["{} {}".format(r["appliance"], r["interface"]) for r in rows if r["status"] == "grey"]
+    if unmeasured:
+        gaps.append("Capacity: {} WAN links had no utilisation samples in the period, so they have no P95: {}.".format(len(unmeasured), ", ".join(unmeasured)))
     measured = [r for r in rows if r["status"] != "grey"]
     flagged = [r for r in measured if r["status"] in ("amber", "red")]
     worst_p95 = max([max(v for v in (r["p95_out_pct"], r["p95_in_pct"]) if v is not None) for r in measured], default=None)
@@ -1815,16 +1886,19 @@ def _capacity(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         value = data.get("shaper:" + str(ne))
         for row in (value.get("data") if isinstance(value, dict) else value) or []:
             if isinstance(row, dict) and "trafficClass" in row:
-                q = qos.setdefault((name, row["trafficClass"], "outbound" if row.get("direction") == 0 else "inbound"), {"bytes": 0, "qos": 0, "other": 0})
+                q = qos.setdefault((name, row["trafficClass"], "outbound" if row.get("direction") == 0 else "inbound"), {"bytes": 0, "qos": 0, "other": 0, "pkts": 0})
+                q["pkts"] += int(row.get("shapedPkts") or 0)
                 q["bytes"] += int(row.get("totalBytes") or 0)
                 q["qos"] += int(row.get("qosDrops") or 0)
                 q["other"] += int(row.get("otherDrops") or 0)
-    qos_rows = [{"appliance": a, "traffic_class": c, "direction": d, "bytes": v["bytes"], "qos_drops": v["qos"], "other_drops": v["other"]}
+    qos_rows = [{"appliance": a, "traffic_class": c, "direction": d, "bytes": v["bytes"], "qos_drops": v["qos"],
+                 "qos_drop_pct": round(100.0 * v["qos"] / (v["pkts"] + v["qos"]), 4) if v["pkts"] + v["qos"] else None, "other_drops": v["other"]}
                 for (a, c, d), v in sorted(qos.items(), key=lambda i: (-i[1]["qos"], -i[1]["other"], str(i[0])))]
     dropping = sum(1 for r in qos_rows if r["qos_drops"])
     sections["cap-qos"] = {"status": "grey" if not qos_rows else "amber" if dropping else "green", "table": qos_rows,
-                           "metrics": [metric("qos_classes_dropping", dropping if qos_rows else None, "classes", "Traffic classes with QoS drops")],
-                           "notes": ["QoS drops are packets the shaper dropped because the class was over its share; most first. Other drops are packets dropped for any other reason."]}
+                           "metrics": [metric("qos_classes_dropping", dropping if qos_rows else None, "entries", "Appliance, class and direction entries with QoS drops")],
+                           "notes": ["QoS drops are packets the shaper dropped because the class was over its share; most first. QoS drop %: of the packets the class sent. "
+                                     "Other drops are packets dropped for any other reason.", "Rule: any QoS drops is a warning; a drop % near 0 means the class only briefly went over its share."]}
     sections["cap-summary"] = {"status": status, "metrics": [m_flag, metric("worst_p95_pct", worst_p95, "%", "Highest WAN P95 utilisation", _load_status(worst_p95, limits)),
                                                              metric("links_measured", len(measured), "links", "WAN links with a P95"),
                                                              metric("wan_links", len(links), "links", "WAN links found")]}
@@ -1873,6 +1947,8 @@ def _lifecycle(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         gaps.append("Licences: the licence portal gave no expiry dates for the appliances, so appliance licence expiry is not checked (the Orchestrator's own licence is).")
     worst_days = min([d for d in [days] + [r["days_left"] for r in lic_rows] if isinstance(d, int)], default=None)
     lic_status = "grey" if not have else "green" if worst_days is None else _expiry_status(worst_days)
+    if not portal_dates and lic_status == "green":  # a good Orchestrator licence says nothing about the appliances' licences
+        lic_status = "grey"
     sections["life-licences"] = {"status": lic_status, "table": sorted(lic_rows, key=lambda r: r["days_left"]),
                                  "metrics": [metric("license_days_left", days, "days", "Days until the Orchestrator licence expires", _expiry_status(days) if isinstance(days, int) else None),
                                              metric("license_used", lic.get("usedAppliances") if lic else None, "appliances", "Licensed appliances in use"),
@@ -1891,12 +1967,12 @@ def _lifecycle(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         age = int((now_s - max(times)) // 86400) if times else None
         stale += age is None or age > 30
         backup_rows.append({"appliance": name, "last_backup": datetime.fromtimestamp(max(times), timezone.utc).strftime("%Y-%m-%d") if times else "none", "days_ago": age,
-                            "status": "amber" if age is None or age > 30 else "green"})
+                            "status": "red" if age is None or age > 90 else "amber" if age > 30 else "green"})
     backup_status = "grey" if not read else "amber" if stale else "green"
     sections["life-backups"] = {"status": backup_status, "table": sorted(backup_rows, key=lambda r: -(r["days_ago"] if r["days_ago"] is not None else 10 ** 6)),
                                 "metrics": [metric("backups_stale", stale if read else None, "appliances", "Appliances without a backup in 30 days", backup_status),
                                             metric("backups_read", read, "appliances", "Appliances whose backup history was read")],
-                                "notes": ["Rule: an appliance with no backup in the last 30 days is amber."]}
+                                "notes": ["Rule: an appliance with no backup in the last 30 days is amber; none in 90 days, or never, is red on its row."]}
 
     # Advisories: a dated, hand-kept list (there is no API); Orchestrator entries are checked against its release.
     hits = []

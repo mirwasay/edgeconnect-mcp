@@ -418,9 +418,9 @@ class ReviewFixTests(unittest.TestCase):
         self.assertTrue(report.compute(b)["stats_store_down"])
 
     def test_licence_tile_and_section_use_one_rule(self):
-        for days, expected in ((30, "red"), (90, "amber"), (91, "green")):
+        for days, expected, section in ((30, "red", "red"), (90, "amber", "amber"), (91, "green", "grey")):  # 91: appliance licences unchecked, so not Good
             m = report.compute(phase2_bundle("lifecycle", gms_license={"daysToExpiration": days}))
-            self.assertEqual((m["metrics"]["license_days_left"]["status"], m["sections"]["life-licences"]["status"]), (expected, expected), days)
+            self.assertEqual((m["metrics"]["license_days_left"]["status"], m["sections"]["life-licences"]["status"]), (expected, section), days)
 
     def test_alarm_list_at_the_cap_is_a_gap(self):
         m = report.compute(phase2_bundle("noc", active_alarms=[{"applianceId": "1.NE", "severity": "MINOR"}] * report.MAX_ALARMS))
@@ -1252,7 +1252,7 @@ class SectionGapTests(unittest.TestCase):
     def test_qos_drops_per_class(self):
         shaper = [{"trafficClass": 2, "direction": 0, "totalBytes": 1000, "qosDrops": 10, "otherDrops": 1}, {"trafficClass": 2, "direction": 0, "totalBytes": 1000, "qosDrops": 0, "otherDrops": 0}]
         m = report.compute(phase2_bundle("capacity", **{"shaper:1.NE": {"data": shaper}}))  # 10.0 wraps the rows in "data"
-        self.assertEqual(m["sections"]["cap-qos"]["table"][0], {"appliance": "branch-a", "traffic_class": 2, "direction": "outbound", "bytes": 2000, "qos_drops": 10, "other_drops": 1})
+        self.assertEqual(m["sections"]["cap-qos"]["table"][0], {"appliance": "branch-a", "traffic_class": 2, "direction": "outbound", "bytes": 2000, "qos_drops": 10, "qos_drop_pct": 100.0, "other_drops": 1})
 
     def test_optimisation_by_application_and_boost(self):
         app = {"nePk": "1.NE", "APPNAME": "CIFS", "SUM_LRX_BYTES": 800, "SUM_LTX_BYTES": 200, "SUM_WTX_BYTES": 300, "SUM_WRX_BYTES": 100}
@@ -1414,7 +1414,7 @@ class HealthByCategoryTests(unittest.TestCase):
         notes = " ".join(m["sections"]["noc-health"]["notes"])
         self.assertIn("MOS is unhealthy in most hours while loss, latency and jitter are healthy", notes)
         row = m["sections"]["noc-health"]["table"][0]
-        self.assertEqual((row["appliance"], row["Loss"]["value"], row["MOS"]["value"], row["MOS"]["status"]), ("branch-a", 100.0, 0.0, "red"))
+        self.assertEqual((row["appliance"], row["Loss"]["value"], row["MOS (not counted)"]["value"], row["MOS (not counted)"]["status"]), ("branch-a", 100.0, 0.0, "red"))
 
     def test_collect_reads_health_once_per_category(self):
         client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
@@ -1543,6 +1543,103 @@ class PersonaReviewTests(unittest.TestCase):
         svg = layout.line("loss", [["p", [["a", 99.9], ["b", 60.0]]]], "%")
         self.assertNotIn(">125<", svg)
         self.assertIn(">100<", svg)
+
+
+class PersonaReviewRound2Tests(unittest.TestCase):
+    """Second set of fresh readers (2026-11-09), each given only its report and the goals."""
+
+    path = PersonaReviewTests.path
+
+    def test_no_data_paths_sort_after_good_ones_and_the_counts_reconcile(self):
+        paths = {"a": {"1.NE": self.path("to_a", 0, 0)}, "b": {"1.NE": self.path("to_b", 50000, 0)}, "c": {"1.NE": self.path("to_c", 50000, 5000)}}
+        m = report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))
+        self.assertEqual([r["tunnel"] for r in m["sections"]["paths-ranked"]["table"]], ["to_c", "to_b", "to_a"])
+        self.assertEqual((m["metrics"]["paths_measured"]["label"], m["metrics"]["paths_graded"]["value"]), ("Tunnels listed", 2))
+        self.assertIn("3 listed = 1 within the thresholds + 0 between + 1 outside + 1 with no data", " ".join(m["sections"]["paths-ranked"]["notes"]))
+
+    def test_health_table_ranks_by_how_many_categories_are_bad(self):
+        h = HealthByCategoryTests.hours
+        data = {"health:ALARM": {"1.NE": h("MAJOR"), "2.NE": h("MAJOR")}, "health:LOSS": {"1.NE": h("HEALTHY"), "2.NE": h("MAJOR")}}
+        table = report.compute(phase2_bundle("noc", **data))["sections"]["noc-health"]["table"]
+        self.assertEqual(table[0]["appliance"], "branch-b<script>")  # bad on two categories, though alphabetically last
+
+    def test_mos_is_left_out_when_the_network_categories_are_mostly_healthy(self):
+        h = HealthByCategoryTests.hours
+        data = {"health:LOSS": {"1.NE": h("HEALTHY")}, "health:JITTER": {"1.NE": h("HEALTHY")}, "health:MOS": {"1.NE": h("MAJOR")},
+                "health:LATENCY": {"1.NE": h("HEALTHY", 22) + [{"status": "MAJOR", "time": NOW - 3600 * 23}, {"status": "MAJOR", "time": NOW - 3600 * 24}]}}
+        head = report.compute(phase2_bundle("noc", **data))["metrics"]["health_good_24h_pct"]
+        self.assertIn("MOS left out", head["label"])  # latency 92% healthy, as on a real site
+
+    def test_noc_alarms_group_repeats_and_show_their_age(self):
+        same = {"applianceId": "1.NE", "severity": "MAJOR", "description": "Overlay Tunnel is down", "timeOccurredInMills": (NOW - 10 * 86400) * 1000}
+        rows = report.compute(phase2_bundle("noc", active_alarms=[same, dict(same), dict(same)]))["sections"]["noc-alarms"]["table"]
+        self.assertEqual((len(rows), rows[0]["count"], rows[0]["open_days"]), (1, 3, 10))
+
+    def test_capacity_names_unmeasured_links_flags_odd_bandwidth_and_counts_entries(self):
+        m = report.compute(phase2_bundle("capacity"))
+        self.assertEqual(m["metrics"]["qos_classes_dropping"]["unit"], "entries")
+        row = {"nePk": "1.NE", "interface": "wan0", "label": "", "bw_tx": 300, "bw_rx": 300}
+        self.assertEqual(report._bandwidth_note(row), "check the configured bandwidth (under 1 Mbps)")
+
+    def test_firewall_flags_heavy_partial_drops_and_zones_missing_from_the_list(self):
+        rows = [{"nePk": "1.NE", "fromZone": "1", "toZone": "3", "flows_allowed": 5000, "flows_dropped": 4000},
+                {"nePk": "1.NE", "fromZone": "3", "toZone": "3", "flows_allowed": 90000, "flows_dropped": 900},
+                {"nePk": "1.NE", "fromZone": "824", "toZone": "3", "flows_allowed": 0, "flows_dropped": 0}]
+        m = report.compute(phase2_bundle("security", zones={"1": {"name": "SOHO"}, "3": {"name": "TRUSTED"}}, **{"security:1.NE": rows}))
+        status = {(r["from_zone"], r["to_zone"]): r["status"] for r in m["sections"]["sec-pairs"]["table"]}
+        self.assertEqual(status[("SOHO", "TRUSTED")], "amber")  # 44% dropped
+        self.assertEqual(status[("TRUSTED", "TRUSTED")], "green")  # 1% dropped
+        self.assertEqual(m["metrics"]["sec_zone_pairs"]["value"], 2)  # pairs that carried flows
+        self.assertEqual(m["metrics"]["sec_dropped_pct"]["value"], 4.905)  # 4,900 of 99,900
+        self.assertIn("zone 824", " ".join(m["sections"]["sec-pairs"]["notes"]))
+
+    def test_unchecked_appliance_licences_are_no_data_and_very_old_backups_critical(self):
+        b = phase2_bundle("lifecycle", gms_license={"daysToExpiration": 500}, portal_appliances={"data": []},
+                          **{"backup:1.NE": [{"backupTime": NOW - 100 * 86400}]})
+        m = report.compute(b)
+        self.assertEqual(m["sections"]["life-licences"]["status"], "grey")
+        self.assertEqual(m["sections"]["life-backups"]["table"][0]["status"], "red")
+
+    def test_incident_status_follows_alarms_raised_in_the_window(self):
+        old = {"id": 1, "applianceId": "1.NE", "severity": "CRITICAL", "timeOccurredInMills": T0 - 30 * 86400000}
+        new = {"id": 2, "applianceId": "1.NE", "severity": "MAJOR", "timeOccurredInMills": T0 + 1000, "clearedTimeInMills": T0 + 3600000 + 60000}
+        b = bundle(incident={"from_ms": T0, "to_ms": T0 + 3600000, "affected": ["1.NE"]}, incident_alarms_stored=True, incident_alarms=[old, new])
+        b["report"] = "incident"
+        m = report.compute(b)
+        self.assertEqual(m["sections"]["inc-timeline"]["status"], "amber")  # the critical one was open for a month before
+        v = lambda k: m["metrics"][k]["value"]
+        self.assertEqual((v("inc_raised_in_window"), v("inc_already_open")), (1, 1))
+        self.assertIn("1 cleared after it", m["metrics"]["inc_open_at_end"]["label"])
+
+    def test_alarms_after_a_change_use_changes_made_by_people_only(self):
+        hour = 3600000
+        audit = [{"user": "OverlayManager", "name": "Add Overlay ACL", "nepk": "1.NE", "queuedTime": 10 * hour, "completionStatus": True},
+                 {"user": "pat@example.com", "name": "Edit template", "nepk": "2.NE", "queuedTime": 10 * hour, "completionStatus": True}]
+        alarms = [{"applianceId": ne, "severity": "MAJOR", "name": "Tunnel down", "timeOccurredInMills": 10 * hour + 60000} for ne in ("1.NE", "2.NE")]
+        m = report.compute(phase2_bundle("activity", activity_audit=audit, activity_alarms=alarms))
+        rows = m["sections"]["act-after-change"]["table"]
+        self.assertEqual([(r["appliance"], r["changed_by"], r["minutes_after"]) for r in rows], [("branch-b<script>", "pat@example.com", 1.0)])
+
+    def test_activity_change_types_that_mostly_fail_are_critical(self):
+        audit = [{"user": "u", "name": "Push", "nepk": "1.NE", "queuedTime": i, "completionStatus": False} for i in range(100)]
+        self.assertEqual(report.compute(phase2_bundle("activity", activity_audit=audit))["sections"]["act-changes"]["status"], "red")
+
+    def test_availability_shows_partial_alarm_counts_and_rates_appliances_below_target(self):
+        listed = [{"applianceId": "1.NE", "severity": "CRITICAL", "description": "x"}]
+        m = report.compute(bundle(appliance_alarms=listed, period_alarms_covered=False))
+        self.assertIsNone(m["metrics"]["alarms_critical"]["value"])  # 7 days of alarms say nothing about an older month
+        self.assertIn("not every alarm of the period", " ".join(m["sections"]["avail-alarms"]["notes"]))  # so the rows shown are explained
+        self.assertNotEqual(m["sections"]["avail-appliances"]["status"], "green")  # branch-a is below the 99.9 target
+
+    def test_optimisation_names_concentration_and_appliances_without_figures(self):
+        flow = lambda ne, lan, wan: {"OPTIMIZED_TRAFFIC": {"X": {ne: {"nePk": ne, "SUM_LRX_BYTES": lan, "SUM_LTX_BYTES": 0, "SUM_WTX_BYTES": wan, "SUM_WRX_BYTES": 0}}}}
+        m = report.compute(phase2_bundle("optimisation", **{"flows:1.NE": flow("1.NE", 1000, 100)}))
+        self.assertEqual(m["metrics"]["opt_top2_share_pct"]["value"], 100.0)
+        self.assertIn("branch-b<script>", " ".join(m["sections"]["opt-appliances"]["notes"]))
+
+    def test_executive_tiles_say_what_period_they_cover(self):
+        m = report.compute(phase2_bundle("availability"))
+        self.assertIn("average over the period", m["metrics"]["fleet_reach_pct"]["label"])
 
 
 if __name__ == "__main__":
