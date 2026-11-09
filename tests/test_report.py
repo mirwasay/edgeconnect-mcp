@@ -1511,7 +1511,7 @@ class PersonaReviewTests(unittest.TestCase):
         self.assertEqual([r["severity"] for r in m["sections"]["inc-timeline"]["table"]], ["critical", "warning"])
         self.assertEqual(m["sections"]["inc-changes"]["status"], "amber")
         self.assertEqual(m["sections"]["inc-appliances"]["table"][0]["status"], "red")  # a critical alarm on it, whatever its reachability
-        self.assertIn("cleared alarms only", m["metrics"]["inc_median_clear_min"]["label"])
+        self.assertIn("alarms cleared by the time the data was collected", m["metrics"]["inc_median_clear_min"]["label"])  # basis stated (round 5)
         self.assertNotIn("--scope", " ".join(m["sections"]["inc-appliances"]["notes"]))
 
     def test_boost_columns_are_words_not_api_fields(self):
@@ -1684,7 +1684,7 @@ class PersonaReviewRound3Tests(unittest.TestCase):
         tunnels = {"1.NE": {"b": {"alias": "to_branch-b<script>_DEFAULT", "operStatus": "Down"}, "c": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}
         m = report.compute(phase2_bundle("noc", tunnels_bonded=tunnels))
         rows = {r["tunnel"]: r for r in m["sections"]["noc-tunnels"]["table"]}
-        self.assertEqual((rows["to_branch-b<script>_DEFAULT"]["peer_unreachable"], rows["to_hub_DEFAULT"]["peer_unreachable"]), ("yes", ""))
+        self.assertEqual((rows["to_branch-b<script>_DEFAULT"]["unreachable_end"], rows["to_hub_DEFAULT"]["unreachable_end"]), ("far end", ""))  # renamed round 5
         self.assertEqual(m["metrics"]["tunnels_down_peer_unreachable"]["value"], 1)
 
     def test_paths_reconcile_line_places_the_tunnels_listed_apart(self):
@@ -1872,6 +1872,124 @@ class Round4DefectTests(unittest.TestCase):
         svg = layout.line("t", [["s", [["a", 2.5e9]]]], "bytes")
         self.assertIn("2.50 GB", svg)
         self.assertNotIn("e+09", svg)
+
+
+class ConsistencyCheckTests(unittest.TestCase):
+    """Page-wide invariants (2026-11-09): every fix is checked against the whole page, not only the figure it touched."""
+
+    def metrics(self, **sections):
+        base = {"report": "noc", "metrics": {}, "sections": {}, "section_list": [], "headline": None}
+        for sid, (status, mids) in sections.items():
+            base["sections"][sid] = {"status": status, "metrics": list(mids)}
+            base["section_list"].append([sid, sid])
+        return base
+
+    def test_a_section_is_never_better_than_a_figure_it_lists(self):
+        m = self.metrics(sec=("green", ["x"]))
+        m["metrics"]["x"] = {"value": 3, "status": "red", "label": "x", "unit": ""}
+        self.assertIn("sec: status green is better than its figure x (red)", report.consistency(m))
+
+    def test_a_figure_that_drives_a_bad_section_carries_a_status(self):
+        m = self.metrics(sec=("red", ["x"]))
+        m["metrics"]["x"] = {"value": 3, "status": None, "label": "x", "unit": ""}
+        self.assertIn("sec: its lead figure x has no status although the section is red", report.consistency(m))
+
+    def test_no_data_is_never_good(self):
+        m = self.metrics(sec=("green", ["x"]))
+        m["metrics"]["x"] = {"value": None, "status": "green", "label": "x", "unit": ""}
+        self.assertIn("x: no data shown as green", report.consistency(m))
+
+    def test_reconcile_lines_add_up(self):
+        m = self.metrics(sec=("green", []))
+        m["sections"]["sec"]["notes"] = ["10 listed = 3 within the thresholds + 2 between + 1 outside + 3 with no data."]
+        self.assertIn("sec: '10 listed = 3 + 2 + 1 + 3' does not add up", report.consistency(m))
+
+    def test_grey_path_rows_carry_no_measurements(self):
+        m = self.metrics(sec=("green", []))
+        m["sections"]["sec"]["table"] = [{"tunnel": "t", "status": "grey", "latency_ms": 0.0, "mos": 4.4}]
+        self.assertIn("sec: row t has no data but shows latency_ms", report.consistency(m))
+
+    def test_real_pages_have_no_problems(self):
+        for name in ("noc", "paths", "capacity", "lifecycle", "activity", "security", "optimisation"):
+            b = phase2_bundle(name, health_threshold=THRESHOLDS)
+            self.assertEqual(report.consistency(report.compute(b)), [], name)
+
+
+class Round5DefectTests(unittest.TestCase):
+    """Defects the fifth set of fresh readers found (2026-11-09)."""
+
+    path = PersonaReviewTests.path
+
+    def test_1_a_link_with_samples_is_not_a_no_samples_gap(self):
+        row = {"appliance": "a", "interface": "wan1", "status": "grey", "check": "check the configured bandwidth (under 1 Mbps)", "p95_out_pct": 27.0, "p95_in_pct": 1.0}
+        self.assertEqual(report._unmeasured([row]), [])
+        self.assertEqual(report._unmeasured([dict(row, check="", p95_out_pct=None, p95_in_pct=None)])[0]["interface"], "wan1")
+
+    def test_2_sites_needing_attention_carries_its_section_status(self):
+        m = report.compute(phase2_bundle("noc", appliances=[dict(APPLIANCES[0]), dict(APPLIANCES[1])]))
+        self.assertEqual(m["metrics"]["sites_needing_attention"]["status"], m["sections"]["noc-worst"]["status"])
+
+    def test_3_a_tunnel_down_on_an_unreachable_appliance_is_explained(self):
+        tunnels = {"2.NE": {"x": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}
+        m = report.compute(phase2_bundle("noc", appliances=[dict(APPLIANCES[0]), dict(APPLIANCES[1])], tunnels_bonded=tunnels))
+        self.assertEqual(m["sections"]["noc-tunnels"]["table"][0]["unreachable_end"], "this appliance")
+
+    def test_4_incident_lists_affected_appliances_without_reachability_and_names_the_clear_basis(self):
+        alarms = [{"id": 1, "applianceId": "1.NE", "severity": "MAJOR", "timeOccurredInMills": T0 + 1000, "clearedTimeInMills": T0 + 3600000 + 60000}]
+        b = bundle(incident={"from_ms": T0, "to_ms": T0 + 3600000, "affected": ["1.NE"]}, incident_alarms_stored=True, incident_alarms=alarms)
+        b["report"] = "incident"
+        m = report.compute(b)
+        self.assertIn({"appliance": "branch-a", "gap": "no reachability samples in the window"}, m["sections"]["data-gaps"]["table"])
+        self.assertIn("cleared by the time the data was collected", m["metrics"]["inc_median_clear_min"]["label"])
+
+    def test_5_mos_only_rows_are_explained(self):
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=127)}}
+        notes = " ".join(report.compute(phase2_bundle("paths", health_threshold=THRESHOLDS, **{"paths:1.NE": paths}))["sections"]["paths-ranked"]["notes"])
+        self.assertIn("1 tunnel is outside the thresholds on MOS alone", notes)
+
+    def test_6_boost_states_its_basis(self):
+        boost = [{"configured": 25000.0, "nePk": "1.NE", "boost_bytes": 2000.0, "seconds_not_boosted": 0}]
+        notes = " ".join(report.compute(phase2_bundle("optimisation", **{"boost:1.NE": boost}))["sections"]["opt-boost"]["notes"])
+        self.assertIn("can be larger than the optimised WAN traffic", notes)
+
+    def test_7_health_table_states_its_order(self):
+        data = {"health:LOSS": {"1.NE": HealthByCategoryTests.hours("HEALTHY")}}
+        notes = " ".join(report.compute(phase2_bundle("noc", **data))["sections"]["noc-health"]["notes"])
+        self.assertIn("Order: most categories rated Critical first", notes)
+
+    def test_8_down_now_is_not_good_and_counts_follow(self):
+        paths = {"a": {"1.NE": self.path("to_hub_DEFAULT", 50000, 0)}}
+        b = phase2_bundle("site", health_threshold=THRESHOLDS, tunnels_bonded={"1.NE": {"x": {"alias": "to_hub_DEFAULT", "operStatus": "Down"}}}, **{"paths:1.NE": paths})
+        m = report.compute(b)
+        row = m["sections"]["paths-ranked"]["table"][0]
+        self.assertEqual((row["status"], row["why"]), ("amber", "down now"))
+        self.assertEqual((m["metrics"]["paths_amber"]["value"], m["metrics"]["paths_ok_pct"]["value"]), (1, 0.0))
+
+    def test_8b_mos_left_out_of_health_is_left_out_of_paths_on_the_same_page(self):
+        h = HealthByCategoryTests.hours
+        paths = {"a": {"1.NE": self.path("to_a", 50000, 0, mos=150)}}
+        data = {"health:LOSS": {"1.NE": h("HEALTHY")}, "health:LATENCY": {"1.NE": h("HEALTHY")}, "health:JITTER": {"1.NE": h("HEALTHY")}, "health:MOS": {"1.NE": h("MAJOR")}}
+        m = report.compute(phase2_bundle("health", health_threshold=THRESHOLDS, **dict(data, **{"paths:1.NE": paths})))
+        self.assertEqual(m["sections"]["paths-ranked"]["table"][0]["status"], "green")
+
+    def test_9_hourly_chart_says_how_it_relates_to_the_total(self):
+        start = NOW - 86400
+        trend = {"column_def": ["TIMESTAMP", "WTX_BYTES", "WRX_BYTES"], "data": [[start + 3600 * h, 2, 0] for h in range(24)]}
+        b = phase2_bundle("traffic", **{"trend:1.NE": trend, "apps:1.NE": [{"APPNAME": "__total__", "SUM_WTX_BYTES": 40, "SUM_WRX_BYTES": 0}]})
+        b["period"].update(from_ms=start * 1000, to_ms=NOW * 1000)
+        notes = " ".join(report.compute(b)["sections"]["traffic-summary"].get("notes") or [])
+        self.assertIn("The hourly figures add up to 48 bytes", notes)
+
+    def test_10_section_index_shows_an_icon_not_colour_alone(self):
+        page = report.render(report.compute(phase2_bundle("noc")))
+        toc = page[page.index('<nav class="toc"'):page.index("</nav>")]
+        self.assertIn('aria-hidden="true">', toc)
+        self.assertRegex(toc, r'title="(Good|Warning|Critical|No data)"')
+
+    def test_11_backup_tile_splits_critical_and_warning(self):
+        backups = {"backup:1.NE": [{"backupTime": NOW - 100 * 86400}], "backup:2.NE": [{"backupTime": NOW - 40 * 86400}]}
+        m = report.compute(phase2_bundle("lifecycle", **backups))
+        self.assertIn("1 over 90 days or never, 1 over 30 days", m["metrics"]["backups_stale"]["label"])
 
 
 if __name__ == "__main__":

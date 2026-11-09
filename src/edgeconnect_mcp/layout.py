@@ -27,6 +27,7 @@ dl.facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:2px 16px
 .verdict{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--ring);border-left:6px solid var(--nodata);padding:12px 16px;border-radius:8px;margin:16px 0}
 .verdict.good{border-left-color:var(--good)}.verdict.warning{border-left-color:var(--warning)}.verdict.critical{border-left-color:var(--critical)}.verdict p{margin:0;font-size:15px}
 .banner{border:2px solid var(--critical);background:var(--surface);padding:12px 16px;border-radius:8px;margin:16px 0}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 nav.toc{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;margin:8px 0 16px}nav.toc a{color:var(--ink2);text-decoration:none}nav.toc a:hover{text-decoration:underline}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--nodata)}.dot.good{background:var(--good)}.dot.warning{background:var(--warning)}.dot.critical{background:var(--critical)}
 .tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:8px}
@@ -305,7 +306,8 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
 def page(title: str, kind: str, facts: Sequence[Tuple[str, str]], options: str, verdict_status: str, verdict_text: str, banner: str,
          index: Sequence[Tuple[str, str, str]], tile_html: str, sections_html: str, appendix: Sequence[str], footer: Sequence[Tuple[str, str]], theme: str = "auto") -> str:
     fact_html = "".join("<div><dt>{}</dt><dd>{}</dd></div>".format(esc(k), esc(v)) for k, v in facts)
-    toc = "".join('<a href="#{}"><span class="dot {}"></span>{}</a>'.format(esc(sid), status_of(st)[0], esc(label)) for sid, label, st in index)
+    toc = "".join('<a href="#{0}" title="{4}"><span class="dot {1}"></span><span aria-hidden="true">{2}</span> {3}<span class="sr"> ({4})</span></a>'.format(
+        esc(sid), status_of(st)[0], status_of(st)[1], esc(label), status_of(st)[2]) for sid, label, st in index)  # icon and word, not colour alone
     if appendix:
         toc += '<a href="#appendix">Appendix</a>'
     foot = "".join("<h3>{}</h3><p>{}</p>".format(esc(h), esc(t)) for h, t in footer)

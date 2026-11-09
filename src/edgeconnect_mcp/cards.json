@@ -94,7 +94,7 @@
     {"id": "tunnels_down", "text": "Tunnels down now: a failed transport at one end, or tunnels to appliances that are themselves unreachable.", "when": [["tunnels_bonded_down", ">", 0]]}
    ],
    "actions": [
-    {"id": "match_with_unreachable", "text": "Start with the tunnels whose far end is unreachable (marked in the table): they come back with that appliance; the rest point to transport problems.", "when": [["tunnels_bonded_down", ">", 0], ["tunnels_down_peer_unreachable", ">", 0]]},
+    {"id": "match_with_unreachable", "text": "Start with the tunnels where one end is an unreachable appliance (the Unreachable end column): they come back with that appliance; the rest point to transport problems.", "when": [["tunnels_bonded_down", ">", 0], ["tunnels_down_peer_unreachable", ">", 0]]},
     {"id": "check_transport", "text": "No tunnel down points at an unreachable appliance: check the transport (underlay) state at both ends.", "when": [["tunnels_bonded_down", ">", 0], ["tunnels_down_peer_unreachable", "==", 0]]}
    ]
   },
