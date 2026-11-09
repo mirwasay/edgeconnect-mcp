@@ -40,7 +40,9 @@
    ]
   },
   "act-changes": {
-   "causes": [],
+   "causes": [
+    {"id": "retry_loop", "text": "A change type that fails almost every time is usually a template or policy the appliance rejects, retried by the Orchestrator's automation.", "when": [["act_changes_failed", "status", ["red"]]]}
+   ],
    "actions": [
     {"id": "review_failed_changes", "text": "Review the failed changes in the table, newest first: a failed template or configuration push leaves the appliance different from what the Orchestrator expects.", "when": [["act_changes_failed", ">", 0]]}
    ]
@@ -78,7 +80,7 @@
   },
   "noc-health": {
    "causes": [
-    {"id": "mos_threshold", "text": "MOS is rated unhealthy almost everywhere while loss, latency and jitter are healthy: the MOS health threshold setting is the likely cause, not the network.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 95], ["health_latency_good_24h_pct", ">=", 95], ["health_jitter_good_24h_pct", ">=", 95]]},
+    {"id": "mos_threshold", "text": "MOS is rated unhealthy almost everywhere while loss, latency and jitter are healthy: the MOS health threshold setting is the likely cause, not the network.", "when": [["health_mos_good_24h_pct", "<", 50], ["health_loss_good_24h_pct", ">=", 90], ["health_latency_good_24h_pct", ">=", 90], ["health_jitter_good_24h_pct", ">=", 90]]},
     {"id": "standing_alarms", "text": "Standing alarms rate every hour as unhealthy until they are cleared, even when traffic is fine.", "when": [["health_alarm_good_24h_pct", "<", 50]]},
     {"id": "path_loss", "text": "Loss outside the threshold on some paths in the last 24 hours.", "when": [["health_loss_good_24h_pct", "<", 95]]}
    ],
@@ -92,7 +94,8 @@
     {"id": "tunnels_down", "text": "Tunnels down now: a failed transport at one end, or tunnels to appliances that are themselves unreachable.", "when": [["tunnels_bonded_down", ">", 0]]}
    ],
    "actions": [
-    {"id": "match_with_unreachable", "text": "Match the tunnels down with the unreachable appliances first; the rest point to transport problems.", "when": [["tunnels_bonded_down", ">", 0]]}
+    {"id": "match_with_unreachable", "text": "Start with the tunnels where one end is an unreachable appliance (the Unreachable end column): they come back with that appliance; the rest point to transport problems.", "when": [["tunnels_bonded_down", ">", 0], ["tunnels_down_peer_unreachable", ">", 0]]},
+    {"id": "check_transport", "text": "No tunnel down points at an unreachable appliance: check the transport (underlay) state at both ends.", "when": [["tunnels_bonded_down", ">", 0], ["tunnels_down_peer_unreachable", "==", 0]]}
    ]
   },
   "cap-links": {
@@ -100,17 +103,21 @@
     {"id": "sustained_load", "text": "Links at or above the planning limit for a large share of hours: sustained demand, or a scheduled job such as backups running in business hours.", "when": [["links_flagged", ">", 0]]}
    ],
    "actions": [
-    {"id": "attribute_before_upgrade", "text": "Before ordering bandwidth, check which applications drive the busy links; QoS or rescheduling may solve it.", "when": [["links_flagged", ">", 0]]}
+    {"id": "attribute_before_upgrade", "text": "Before ordering bandwidth, check which applications drive the busy links; QoS or rescheduling may solve it.", "when": [["links_flagged", ">", 0]]},
+    {"id": "no_upgrade_needed", "text": "No link reached the planning limit: no upgrade is needed on this period's data. Recheck over a full month before deciding.", "when": [["links_flagged", "==", 0], ["links_measured", ">", 0]]}
    ]
   },
   "life-licences": {
    "causes": [],
    "actions": [
-    {"id": "renew_licences", "text": "Start renewal for licences expiring within 90 days.", "when": [["licences_expiring_90", ">", 0]]}
+    {"id": "renew_licences", "text": "Start renewal for licences expiring within 90 days.", "when": [["licences_expiring_90", ">", 0]]},
+    {"id": "check_portal_expiry", "text": "Look up the appliance licence expiry dates in the HPE licence portal; this report could not read them.", "when": [["licences_expiring_90", "==", null]]}
    ]
   },
   "life-backups": {
-   "causes": [],
+   "causes": [
+    {"id": "backup_schedule", "text": "Appliances without a recent backup: the scheduled backup job is off or failing for them, or they were unreachable when it ran.", "when": [["backups_stale", ">", 0]]}
+   ],
    "actions": [
     {"id": "fix_backups", "text": "Check the scheduled backup job for appliances without a backup in 30 days.", "when": [["backups_stale", ">", 0]]}
    ]
@@ -125,6 +132,58 @@
    "causes": [],
    "actions": [
     {"id": "converge_trains", "text": "More than one ECOS train is in use: plan to bring appliances onto one supported train.", "when": [["ecos_trains", ">", 1]]}
+   ]
+  },
+  "sec-pairs": {
+   "causes": [
+    {"id": "blocked_pairs", "text": "A zone pair dropping every flow, or a large share: an intended deny, a missing allow rule, or an interface left in the default zone.", "when": [["sec_pairs_flagged", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "review_flagged_pairs", "text": "For each flagged pair, confirm in the Orchestrator's firewall policy that the drops are intended; add an allow rule or move the interface to the right zone if not.", "when": [["sec_pairs_flagged", ">", 0]]}
+   ]
+  },
+  "cap-qos": {
+   "causes": [
+    {"id": "class_share", "text": "QoS drops on a link that is far from full point to a class share or shaper rate set too low, or to short bursts, rather than to too little bandwidth.", "when": [["qos_classes_dropping", ">", 0]]}
+   ],
+   "actions": [
+    {"id": "review_class_share", "text": "Review the minimum bandwidth of the dropping classes in the shaper before considering an upgrade.", "when": [["qos_classes_dropping", ">", 0]]}
+   ]
+  },
+  "opt-appliances": {
+   "causes": [],
+   "actions": [
+    {"id": "review_low_savers", "text": "Most of the saving comes from two appliances: check the optimisation policy on the others (traffic may be encrypted or already compressed, or optimisation not applied).", "when": [["opt_top2_share_pct", ">=", 80]]}
+   ]
+  },
+  "act-alarms": {
+   "causes": [],
+   "actions": [
+    {"id": "triage_critical_types", "text": "Start with the critical alarm types at the top of the table; find their appliances in the NOC digest.", "when": [["act_alarms", ">", 0]]}
+   ]
+  },
+  "inc-appliances": {
+   "causes": [],
+   "actions": [
+    {"id": "start_with_critical_appliances", "text": "Start with the appliances rated Critical (a critical alarm raised in the window, or reachability below target), then Warning.", "when": [["inc_affected", ">", 0]]}
+   ]
+  },
+  "inc-timeline": {
+   "causes": [],
+   "actions": [
+    {"id": "work_window_alarms", "text": "Work through the alarms raised in the window first, by appliance; the already-open ones were there before the incident.", "when": [["inc_raised_in_window", ">", 0]]}
+   ]
+  },
+  "inc-changes": {
+   "causes": [],
+   "actions": [
+    {"id": "check_failed_changes", "text": "Check the failed changes on the affected appliances; for a full audit trail of the window, send the audit log to a remote log receiver.", "when": [["inc_changes_failed", ">", 0]]}
+   ]
+  },
+  "noc-worst": {
+   "causes": [],
+   "actions": [
+    {"id": "work_by_score", "text": "Work down the table from the highest score; unreachable appliances score highest because nothing else can be checked until they are back.", "when": [["sites_needing_attention", ">", 0]]}
    ]
   }
  }

@@ -27,6 +27,7 @@ dl.facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:2px 16px
 .verdict{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--ring);border-left:6px solid var(--nodata);padding:12px 16px;border-radius:8px;margin:16px 0}
 .verdict.good{border-left-color:var(--good)}.verdict.warning{border-left-color:var(--warning)}.verdict.critical{border-left-color:var(--critical)}.verdict p{margin:0;font-size:15px}
 .banner{border:2px solid var(--critical);background:var(--surface);padding:12px 16px;border-radius:8px;margin:16px 0}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 nav.toc{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;margin:8px 0 16px}nav.toc a{color:var(--ink2);text-decoration:none}nav.toc a:hover{text-decoration:underline}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--nodata)}.dot.good{background:var(--good)}.dot.warning{background:var(--warning)}.dot.critical{background:var(--critical)}
 .tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:8px}
@@ -97,9 +98,10 @@ def bars(title: str, points: Sequence[Tuple[str, float]], zoom: bool) -> str:
     for i, (label, value) in enumerate(points):
         y = top + i * row
         length = 0 if value <= floor else (value - floor) / (ceiling - floor) * (x1 - x0)
-        parts.append('<g><title>{0}: {1:.2f}%</title><text class="lbl" x="{2}" y="{3}" text-anchor="end">{4}</text>'
-                     '<rect class="bar" x="{5}" y="{6}" width="{7:.1f}" height="12" rx="3"/><text class="val" x="{8:.1f}" y="{3}">{1:.2f}%</text></g>'.format(
-                         esc(label), value, x0 - 8, y + 11, esc(str(label)[:34]), x0, y + 1, max(length, 1.5), x0 + max(length, 1.5) + 6))
+        shown = ("{:.3f}" if zoom else "{:.1f}").format(value)  # the same decimals as the table beside it: availability 3, other percentages 1
+        parts.append('<g><title>{0}: {1}%</title><text class="lbl" x="{2}" y="{3}" text-anchor="end">{4}</text>'
+                     '<rect class="bar" x="{5}" y="{6}" width="{7:.1f}" height="12" rx="3"/><text class="val" x="{8:.1f}" y="{3}">{1}%</text></g>'.format(
+                         esc(label), shown, x0 - 8, y + 11, esc(str(label)[:34]), x0, y + 1, max(length, 1.5), x0 + max(length, 1.5) + 6))
     parts.append('<line class="base" x1="{0}" x2="{0}" y1="{1}" y2="{2}"/>'.format(x0, top - 2, top + len(points) * row))
     return '<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg></figure>'.format(
         width, top + len(points) * row + 4, esc(title), esc(title), "".join(parts))
@@ -158,6 +160,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
     peak = max([v for _, pts in series for _, v in pts] + ([threshold] if threshold is not None else []) + [0.0])
     step = 10 ** max(0, len("{:.0f}".format(peak)) - 1) / 2 or 1.0
     top = max(step, -(-peak * 1.1 // step) * step)
+    if unit == "%" and peak <= 100:
+        top = min(top, 100.0)  # a share never goes past 100
     sx = lambda i: x0 + (i * (x1 - x0) / (len(labels) - 1) if len(labels) > 1 else (x1 - x0) / 2)
     sy = lambda v: y0 - v / top * (y0 - y1)
     parts = []
@@ -176,8 +180,8 @@ def line(title: str, series: Sequence[Tuple[str, Sequence[Tuple[str, float]]]], 
         coords = " ".join("{:.1f},{:.1f}".format(sx(at[label]), sy(v)) for label, v in pts)
         parts.append('<polyline fill="none" stroke="{}" stroke-width="2" points="{}"><title>{}</title></polyline>'.format(SERIES[k], coords, esc(name)))
         # a marker per point, so a series with one point (or isolated ones) still shows; hover gives the value
-        parts += ['<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}"><title>{} {}: {:g}{}</title></circle>'.format(sx(at[label]), sy(v), SERIES[k], esc(name), esc(label), round(v, 3), esc(unit))
-                  for label, v in pts]
+        parts += ['<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}"><title>{} {}: {}</title></circle>'.format(
+            sx(at[label]), sy(v), SERIES[k], esc(name), esc(label), human_bytes(v) if unit == "bytes" else "{:g}{}".format(round(v, 3), esc(unit))) for label, v in pts]
     legend = "".join('<span><i style="background:{}"></i>{}</span>'.format(SERIES[k], esc(name)) for k, (name, _) in enumerate(series))
     return ('<figure><svg class="chart" viewBox="0 0 {} {}" role="img" aria-label="{}"><title>{}</title>{}</svg><figcaption class="legend">{}</figcaption></figure>').format(
         width, height + 10, esc(title), esc(title), "".join(parts), legend)
@@ -194,7 +198,7 @@ def human_bytes(n: float) -> str:
 HEADERS = {"nePk": "nePk", "wan_bytes": "WAN traffic", "lan_bytes": "LAN traffic", "saved_bytes": "Saved", "bytes": "Traffic", "mos": "MOS",
            "pre_fec_loss_pct": "Loss before FEC %", "p95_out_pct": "P95 out %", "p95_in_pct": "P95 in %", "avg_out_pct": "Average out %",
            "avg_in_pct": "Average in %", "avg_change_pts": "Change in average (points)", "dscp": "DSCP", "qos_drops": "QoS drops",
-           "source_ip": "Source IP", "bw_utilization": "Utilisation", "alarm": "Alarm", "nepk": "nePk"}
+           "source_ip": "IP address (either end)", "ecos": "ECOS build", "bw_utilization": "Utilisation", "alarm": "Alarm", "nepk": "nePk"}
 
 
 def header(column: str) -> str:
@@ -218,6 +222,14 @@ def number(column: str, value: float) -> str:
         return "{:,.2f}".format(value)
     if column.endswith("_ms"):
         return "{:,.0f}".format(value)
+    if column.endswith("drop_pct"):
+        return "{:,.4f}".format(value)  # drop rates are tiny: 4 decimals so they do not read as 0
+    if column.endswith("_pct") and 0 < value < 0.05:
+        return "<0.1"  # not 0.0: something did happen
+    if column.endswith("_pct") and -0.05 < value < 0:
+        return "0.0"  # not "-0.0"
+    if column.endswith("_kbps"):
+        return "{:,.0f}".format(value)
     return "{:,.1f}".format(value) if column.endswith("_pct") else "{:,.2f}".format(value)
 
 
@@ -233,11 +245,12 @@ def cell(value: Any) -> Tuple[str, bool]:
     return str(value), False
 
 
-def table(rows: Sequence[Mapping[str, Any]]) -> str:
+def table(rows: Sequence[Mapping[str, Any]], full: Optional[Sequence[Mapping[str, Any]]] = None) -> str:
     """Every row, every column, in the order given; numbers right-aligned; a `status` column shown as a pill."""
     if not rows:
         return ""
-    columns = list(rows[0].keys())
+    every = full or rows  # columns are chosen on the whole table, so the rows shown in place and the appendix have the same columns
+    columns = [c for c in rows[0].keys() if any(r.get(c) not in ("", None) for r in every) or any(r.get(c) is None for r in every)]  # blank on every row: says nothing
     plain = lambda v: v.get("value") if isinstance(v, dict) else v  # a cell may be {"value": .., "status": ..}, shown with its status icon
     numeric = {c for c in columns if all(isinstance(plain(r.get(c)), (int, float)) and not isinstance(plain(r.get(c)), bool) for r in rows if plain(r.get(c)) is not None)
                and any(plain(r.get(c)) is not None for r in rows)}
@@ -271,7 +284,7 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
             appendix.append('<section class="appendix" id="appendix-{0}" data-section-id="appendix-{0}"><h2>Appendix: {1}</h2><p>All {2:,} rows.</p>{3}</section>'.format(
                 esc(sid), esc(title), len(rows), table(rows)))
             view = '<details class="tbl" open><summary>Table</summary>{}</details><p class="options">{} {} of {:,} shown; <a href="#appendix-{}">all {:,} rows in the appendix</a>.</p>'.format(
-                table(rows[:SHOWN_ROWS]), "Worst" if "status" in rows[0] or any(isinstance(v, dict) for v in rows[0].values()) else "Top", SHOWN_ROWS, len(rows), esc(sid), len(rows))
+                table(rows[:SHOWN_ROWS], rows), "Worst" if "status" in rows[0] or any(isinstance(v, dict) for v in rows[0].values()) else "Top", SHOWN_ROWS, len(rows), esc(sid), len(rows))
         else:
             view = '<details class="tbl" open><summary>Table ({} row{})</summary>{}</details>'.format(len(rows), "" if len(rows) == 1 else "s", table(rows))
     if apart and apart.get("rows"):  # things set aside (idle tunnels, unused ports): a table at the end, never a paragraph of names
@@ -293,7 +306,8 @@ def section(sid: str, number: int, title: str, status: str, summary: str, figure
 def page(title: str, kind: str, facts: Sequence[Tuple[str, str]], options: str, verdict_status: str, verdict_text: str, banner: str,
          index: Sequence[Tuple[str, str, str]], tile_html: str, sections_html: str, appendix: Sequence[str], footer: Sequence[Tuple[str, str]], theme: str = "auto") -> str:
     fact_html = "".join("<div><dt>{}</dt><dd>{}</dd></div>".format(esc(k), esc(v)) for k, v in facts)
-    toc = "".join('<a href="#{}"><span class="dot {}"></span>{}</a>'.format(esc(sid), status_of(st)[0], esc(label)) for sid, label, st in index)
+    toc = "".join('<a href="#{0}" title="{4}"><span class="dot {1}"></span><span aria-hidden="true">{2}</span> {3}<span class="sr"> ({4})</span></a>'.format(
+        esc(sid), status_of(st)[0], status_of(st)[1], esc(label), status_of(st)[2]) for sid, label, st in index)  # icon and word, not colour alone
     if appendix:
         toc += '<a href="#appendix">Appendix</a>'
     foot = "".join("<h3>{}</h3><p>{}</p>".format(esc(h), esc(t)) for h, t in footer)
