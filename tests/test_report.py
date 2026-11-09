@@ -1127,6 +1127,49 @@ class AvailabilityReworkTests(unittest.TestCase):
         self.assertEqual(roles, {"hub": 99.5, "branch": 100.0})
 
 
+class SiteAndCustomTests(unittest.TestCase):
+    """C3 site report (one appliance, every area) and C4 custom bundle (the parts the user names)."""
+
+    def test_custom_stitches_the_named_parts_in_order(self):
+        b = phase2_bundle("custom", **TrafficTests().data())
+        b["options"] = {"parts": ["traffic", "paths"]}
+        m = report.compute(b)
+        ids = [sid for sid, _ in m["section_list"]]
+        self.assertEqual(ids[:2], ["traffic-summary", "traffic-apps"])
+        self.assertIn("paths-ranked", ids)
+        self.assertEqual(ids[-1], "data-gaps")
+        self.assertEqual(ids.count("data-gaps"), 1)
+        page = report.render(m)
+        self.assertIn('data-section-id="paths-ranked"', page)
+        self.assertEqual(report.template(m)["sections"].keys(), dict(m["section_list"]).keys())
+
+    def test_site_needs_one_appliance_and_custom_needs_parts(self):
+        client = RoutedClient({"/gms/versions": {}, "/appliance": APPLIANCES})
+        with tempfile.TemporaryDirectory() as tmp:
+            spec = Path(tmp) / "spec.json"
+            spec.write_text(json.dumps(SPEC))
+            server = Server({"lab": Orchestrator("lab", Config(base_url="https://orch.example/gms/rest", api_key="KEY"), False, str(spec), client)}, default="lab", log=lambda l: None)
+            with self.assertRaises(ValueError):
+                report.collect(server, "lab", "site", now=datetime(2026, 9, 21, tzinfo=timezone.utc))  # scope missing
+            with self.assertRaises(ValueError):
+                report.collect(server, "lab", "custom", now=datetime(2026, 9, 21, tzinfo=timezone.utc))  # parts missing
+            b = report.collect(server, "lab", "site", appliances=["branch-a"], now=datetime(2026, 9, 21, tzinfo=timezone.utc), history_root=Path(tmp) / "h")
+        self.assertEqual(b["options"]["parts"], list(report.PARTS["site"]))
+
+
+class ConsistencyTests(unittest.TestCase):
+    """What two models can differ on: only the summary sentences. Same data gives the same sections, numbers, statuses, causes and actions."""
+
+    def test_two_narratives_change_only_the_summary_sentences(self):
+        b = phase2_bundle("noc", **{"health:MOS": {"1.NE": HealthByCategoryTests.hours("MAJOR")}, "health:LOSS": {"1.NE": HealthByCategoryTests.hours("HEALTHY")}})
+        m1, m2 = report.compute(json.loads(json.dumps(b))), report.compute(json.loads(json.dumps(b)))
+        self.assertEqual(m1, m2)  # compute is deterministic
+        one = {"report": "noc", "sections": {"noc-health": {"text": "MOS was rated good in {{m:health_mos_good_24h_pct}} of hours."}}}
+        two = {"report": "noc", "sections": {"noc-health": {"text": "Only {{m:health_mos_good_24h_pct}} of hours had a good MOS rating."}}}
+        strip = lambda page: re.sub(r'<p class="summary">.*?</p>', "", page)
+        self.assertEqual(strip(report.render(m1, one)), strip(report.render(m2, two)))
+
+
 class HealthByCategoryTests(unittest.TestCase):
     """POST /health read once per category, so one category that is always unhealthy cannot hide behind the combined status."""
 

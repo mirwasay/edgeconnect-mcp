@@ -31,7 +31,8 @@ from .errors import EdgeConnectError
 from .server import HOME_DOTENV, Server, ToolError
 
 STATUSES = ("green", "amber", "red", "grey")
-REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations", "optimisation", "security", "activity")
+REPORTS = ("availability", "noc", "capacity", "lifecycle", "incident", "executive", "traffic", "paths", "operations", "optimisation", "security", "activity", "site", "custom")
+STITCHED = ("site", "custom")  # their sections are their parts' sections, in part order (computed into metrics["section_list"])
 SECTIONS = {
     "availability": (("avail-summary", "Availability summary"), ("avail-appliances", "Appliance reachability"),
                      ("avail-roles", "Hubs and branches"), ("avail-tunnels", "Tunnel availability"), ("avail-interfaces", "Interface availability"),
@@ -63,7 +64,8 @@ TITLES = {"availability": "Availability report", "noc": "NOC digest", "capacity"
           "lifecycle": "Lifecycle, licence and vulnerability report", "incident": "Major incident report",
           "executive": "Executive summary", "traffic": "Traffic and applications report",
           "paths": "Path quality report", "operations": "Operations summary", "optimisation": "WAN optimisation report",
-          "security": "Firewall report", "activity": "Change and alarm activity report"}
+          "security": "Firewall report", "activity": "Change and alarm activity report",
+          "site": "Site report", "custom": "Custom report"}
 INCIDENT_LOOKBACK_MS = 24 * 3600000  # changes in the 24 hours before an incident are shown next to it
 INCIDENT_MAX_APPLIANCES = 20
 INCIDENT_MAX_MS = 7 * 86400000  # longer windows are periods, not incidents (and the minute reachability is read per day)
@@ -71,7 +73,9 @@ AUDIT_PAGE = 10000  # GET /action returns at most this many entries, newest firs
 AUDIT_MAX_PAGES = 100  # activity report: at most this many pages (1,000,000 changes) before the rest is a named gap
 # The executive page's KPI strip: availability, overlays, sites below target, critical alarms, licence, capacity, NOC, advisories.
 EXEC_KPIS = ("fleet_reach_pct", "paths_ok_pct", "wan_bytes_total", "worst_p95_pct", "active_critical", "license_days_left")
-PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle", "traffic", "paths"), "operations": ("noc", "paths", "capacity")}  # reports that combine others; the rest are themselves
+PARTS = {"executive": ("availability", "noc", "capacity", "lifecycle", "traffic", "paths"), "operations": ("noc", "paths", "capacity"),
+         "site": ("noc", "paths", "capacity", "traffic", "activity")}
+CUSTOM_PARTS = ("availability", "noc", "capacity", "lifecycle", "traffic", "paths", "optimisation", "security", "activity")  # reports that combine others; the rest are themselves
 ROLE_NAMES = {"0": "branch", "1": "hub", "2": "mesh"}  # GET /appliance `networkRole`
 STATE_NAMES = {1: "normal", 2: "unreachable", 3: "unsupported", 4: "out of sync", 5: "syncing"}  # GET /appliance `state`
 GOOD_HEALTH = ("HEALTHY",)  # POST /health hourly `status` that counts as good; the spec enum is HEALTHY, WARNING, MINOR, MAJOR, CRITICAL
@@ -84,7 +88,7 @@ DEFAULT_OPTIONS = {"period": "last-month", "scope": "all", "target": "orchestrat
 SEVERITY_ORDER = {"critical": 0, "major": 1, "minor": 2, "warning": 3}
 MAX_ALARMS = 10000
 WINDOW_PERIODS = {"last-24-hours": 86400, "last-7-days": 7 * 86400}  # rolling windows ending now, for reports that read stats aggregates
-DEFAULT_PERIOD = {r: "last-7-days" for r in ("traffic", "paths", "operations", "optimisation", "security", "activity")}  # every other report defaults to DEFAULT_OPTIONS["period"]
+DEFAULT_PERIOD = {r: "last-7-days" for r in ("traffic", "paths", "operations", "optimisation", "security", "activity", "site", "custom")}  # every other report defaults to DEFAULT_OPTIONS["period"]
 TRAFFIC_TOP = 100000  # `top` sent so the Orchestrator returns every application, domain and port, not its default ten
 TALKERS_CAP = 100  # GET /stats/aggregate/topTalkers returns at most 100 per appliance whatever `top` asks (seteam, 10.0, 2026-11-08)
 TRAFFIC_PATHS = ("/stats/aggregate/application2", "/stats/aggregate/topTalkers", "/stats/aggregate/dns", "/stats/aggregate/ports", "/stats/aggregate/trafficClass")
@@ -204,17 +208,26 @@ def resolve_month(period: str, now: datetime) -> str:
 
 def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = None, appliances: Optional[List[str]] = None, top: Optional[int] = None,
             now: Optional[datetime] = None, period: Optional[str] = None, target: str = "orchestrator", down_tunnels: str = DEFAULT_OPTIONS["down_tunnels"],
-            window: Optional[Tuple[datetime, datetime]] = None, alarm_id: Optional[str] = None, history_root: Path = HISTORY_ROOT) -> Dict[str, Any]:
+            window: Optional[Tuple[datetime, datetime]] = None, alarm_id: Optional[str] = None, history_root: Path = HISTORY_ROOT,
+            parts: Optional[List[str]] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     if report == "incident" and not window and not alarm_id:
         raise ValueError("the incident report needs --from and --to, or --alarm-id")
     for name, value in (("target", target), ("down_tunnels", down_tunnels)):
         if value not in OPTIONS[name]:
             raise ValueError("{} must be one of {}".format(name, ", ".join(OPTIONS[name])))
+    if report == "custom":
+        unknown = [p for p in parts or [] if p not in CUSTOM_PARTS]
+        if not parts or unknown:
+            raise ValueError("the custom report needs --parts, a comma-separated list of: {}".format(", ".join(CUSTOM_PARTS)))
+        if "availability" in parts and not period and not month:
+            period = "last-month"  # availability is monthly
+    if report == "site" and (not appliances or len(appliances) != 1):
+        raise ValueError("the site report needs --scope with exactly one appliance")
     period = period or DEFAULT_PERIOD.get(report, DEFAULT_OPTIONS["period"])
     options = {"period": "month" if month else period, "scope": "all", "target": target, "down_tunnels": down_tunnels}
     if period in WINDOW_PERIODS and not month:
-        if report not in tuple(DEFAULT_PERIOD) + ("noc", "lifecycle"):
+        if report not in tuple(DEFAULT_PERIOD) + ("noc", "lifecycle") or "availability" in (parts or []):
             raise ValueError("--period {} is for the traffic report; {} takes a month (last-month, month-to-date or --month)".format(period, report))
         end_ms = int(now.timestamp()) // 3600 * 3600 * 1000  # whole hours, so the previous window lines up
         start_ms, first = end_ms - WINDOW_PERIODS[period] * 1000, None
@@ -223,6 +236,8 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
         month = month or resolve_month(period, now)
         first, start_ms, end_ms = month_window(month, now)
     options["month"] = month
+    if report in STITCHED:
+        options["parts"] = list(PARTS.get(report) or parts or [])
     c = Collector(server, orchestrator)
     c.call("versions", "/gms/versions")
     inventory = c.call("appliances", "/appliance") or []
@@ -235,7 +250,7 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
         c.data["appliances"] = inventory
         options["scope"] = list(appliances)
     nepks = [a["nePk"] for a in inventory if a.get("nePk")]
-    parts = PARTS.get(report, (report,))
+    parts = tuple(options.get("parts") or PARTS.get(report, (report,)))
     if "availability" in parts:
         _collect_availability(c, nepks, first, start_ms, end_ms, int(now.timestamp() * 1000), history_root)
     if "noc" in parts:
@@ -257,18 +272,21 @@ def collect(server: Any, orchestrator: str, report: str, month: Optional[str] = 
     if "activity" in parts:
         keep = ("id", "queuedTime", "user", "name", "nepk", "completionStatus")
         entries: Optional[List[Dict[str, Any]]] = []
-        until, pages = end_ms, 0
-        while True:  # GET /action pages newest first: a full page means older entries remain, so read again up to its oldest entry
-            page = c.call("activity_audit_page", "/action", {"startTime": start_ms, "endTime": until, "limit": AUDIT_PAGE}, keep=False)
-            if not isinstance(page, list):
-                entries = None if not entries else entries
-                break
-            entries += [{k: r.get(k) for k in keep} for r in page if isinstance(r, dict)]
-            pages += 1
-            oldest = min((r.get("queuedTime") or until for r in page if isinstance(r, dict)), default=until)
-            if len(page) < AUDIT_PAGE or oldest <= start_ms or pages >= AUDIT_MAX_PAGES:
-                break
-            until = oldest - 1
+        pages = 0
+        # A scoped report reads each appliance's own log (GET /action filters by appliance); an unscoped one reads everything.
+        for only in (nepks if appliances and len(nepks) <= INCIDENT_MAX_APPLIANCES else [None]):
+            until = end_ms
+            while entries is not None:  # GET /action pages newest first: a full page means older entries remain, so read again up to its oldest entry
+                page = c.call("activity_audit_page", "/action", dict({"startTime": start_ms, "endTime": until, "limit": AUDIT_PAGE}, **({"appliance": only} if only else {})), keep=False)
+                if not isinstance(page, list):
+                    entries = None if not entries else entries
+                    break
+                entries += [{k: r.get(k) for k in keep} for r in page if isinstance(r, dict)]
+                pages += 1
+                oldest = min((r.get("queuedTime") or until for r in page if isinstance(r, dict)), default=until)
+                if len(page) < AUDIT_PAGE or oldest <= start_ms or pages >= AUDIT_MAX_PAGES:
+                    break
+                until = oldest - 1
         c.data["activity_audit"] = _merge_by_id(entries) if entries is not None else None
         c.data["activity_audit_full"] = pages >= AUDIT_MAX_PAGES
         rows, failed, notes, source = read_alarms(c.pager(), nepks, c.read_posts, start_ms, end_ms)
@@ -650,9 +668,9 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     inventory = data.get("appliances") or []
     names = {a.get("nePk"): a.get("hostName") or a.get("nePk") for a in inventory}
     now_s = int(bundle["period"].get("now_s") or bundle["period"]["to_ms"] // 1000)
-    parts = PARTS.get(report, (report,))
     options = dict(DEFAULT_OPTIONS, month=bundle["period"]["month"])
     options.update(bundle.get("options") or {})
+    parts = tuple(options.get("parts") or PARTS.get(report, (report,)))
     ctx = {"data": data, "inventory": inventory, "names": names, "metric": metric, "metrics": metrics, "gaps": gaps, "stats_down": stats_down, "now_s": now_s, "options": options,
            "period_from_s": bundle["period"]["from_ms"] // 1000,
            "period_s": max(1, (bundle["period"]["to_ms"] - bundle["period"]["from_ms"]) // 1000)}
@@ -709,20 +727,23 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
     for sid, sec in sections.items():  # possible causes and actions: only card entries whose conditions hold
         sources = EXEC_SOURCES.get(sid, (sid,))
         sec["causes"], sec["actions"] = _eligible(sources, metrics, "causes"), _eligible(sources, metrics, "actions")
+    section_list = SECTIONS[report] if report not in STITCHED else \
+        list(dict(item for part in parts for item in SECTIONS[part] if item[0] != "data-gaps").items()) + [("data-gaps", "Data gaps")]
     for sid in ("exec-actions", "ops-actions"):  # one list of every action the summary's sections show, in section order
-        if sid in dict(SECTIONS[report]):
-            listed = [a for other, _ in SECTIONS[report] if other in sections for a in sections[other].get("actions", [])]
+        if sid in dict(section_list):
+            listed = [a for other, _ in section_list if other in sections for a in sections[other].get("actions", [])]
             unique = list({a["id"]: a for a in listed}.values())
             sections[sid] = {"status": "amber" if unique else "green", "metrics": [], "actions": unique, "causes": [],
                              "notes": [] if unique else ["No action needed from this period's data."]}
     sections["data-gaps"] = {"status": "grey" if gaps else "green", "metrics": [], "notes": gaps or ["None: every call returned data."]}
     headline = None
-    if report in ("executive", "operations"):
-        areas = [sid for sid, _ in SECTIONS[report] if sid not in ("data-gaps", "exec-actions", "ops-actions")]
+    if report in ("executive", "operations") + STITCHED:
+        areas = [sid for sid, _ in section_list if sid not in ("data-gaps", "exec-actions", "ops-actions")]
         overall = worst([sections[sid]["status"] for sid in areas])
-        attention = [dict(SECTIONS[report])[sid] for sid in areas if sections[sid]["status"] in ("amber", "red")]
-        kpis = EXEC_KPIS if report == "executive" else ("state_unreachable", "active_critical", "health_good_24h_pct", "tunnels_bonded_down", "paths_ok_pct", "worst_p95_pct")
-        headline = {"status": overall, "kpis": [k for k in kpis if k in metrics],
+        attention = [dict(section_list)[sid] for sid in areas if sections[sid]["status"] in ("amber", "red")]
+        kpis = EXEC_KPIS if report == "executive" else ("state_unreachable", "active_critical", "health_good_24h_pct", "tunnels_bonded_down", "paths_ok_pct", "worst_p95_pct",
+                                                         "wan_bytes_total", "fleet_reach_pct", "act_alarms", "opt_reduction_pct", "sec_flows_dropped")
+        headline = {"status": overall, "kpis": [k for k in kpis if k in metrics][:6],
                     "text": "Overall: {}. {}.".format(layout.STATUS[overall][2], "No area needs attention" if not attention else "Attention needed in " + ", ".join(attention))}
 
     # An appliance counts as covered when any per-appliance read returned something for it (keyed "<what>:<nePk>", or named inside a result).
@@ -734,7 +755,7 @@ def compute(bundle: Mapping[str, Any]) -> Dict[str, Any]:
             "coverage": {"appliances": len(names), "with_data": answered}, "stats_store_down": stats_down,
             "options": dict(options, down_tunnels_count=metrics.get("tunnel_groups_down_all_period", {}).get("value"),
                             idle_paths_count=metrics.get("paths_idle_probe_loss", {}).get("value")),
-            "headline": headline, "metrics": metrics, "sections": {sid: sections[sid] for sid, _ in SECTIONS[report]}}
+            "headline": headline, "metrics": metrics, "section_list": [list(i) for i in section_list], "sections": {sid: sections[sid] for sid, _ in section_list}}
 
 
 def clause_holds(clause: List[Any], metrics: Mapping[str, Mapping[str, Any]]) -> bool:
@@ -1650,8 +1671,13 @@ def _lifecycle(ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 # --- narrative -----------------------------------------------------------------
 
+def _section_list(metrics: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    """Section ids and titles in page order; stitched reports carry theirs, older metrics files use the fixed list."""
+    return [(str(i[0]), str(i[1])) for i in metrics.get("section_list") or SECTIONS[metrics["report"]]]
+
+
 def template(metrics: Mapping[str, Any]) -> Dict[str, Any]:
-    order = [sid for sid, _ in SECTIONS[metrics["report"]] if sid in metrics["sections"]]  # metrics.json keys are sorted
+    order = [sid for sid, _ in _section_list(metrics) if sid in metrics["sections"]]  # metrics.json keys are sorted
     return {"report": metrics["report"], "sections": {sid: {"status": metrics["sections"][sid]["status"], "text": "", "cite": [m for m in metrics["sections"][sid]["metrics"] if m in metrics["metrics"]]} for sid in order}}
 
 
@@ -1744,9 +1770,9 @@ def render(metrics: Mapping[str, Any], narrative: Optional[Mapping[str, Any]] = 
         if problems:
             raise ValueError("narrative.json is not valid:\n" + "\n".join(problems))
     name = metrics["report"]
-    titles = dict(SECTIONS[name])
+    titles = dict(_section_list(metrics))
     texts = (narrative or {}).get("sections") or {}
-    order = [sid for sid, _ in SECTIONS[name] if sid in metrics["sections"]]  # metrics.json keys are sorted
+    order = [sid for sid, _ in _section_list(metrics) if sid in metrics["sections"]]  # metrics.json keys are sorted
     shown = lambda mid: (metrics["metrics"][mid]["label"], _fmt(metrics["metrics"][mid]), metrics["metrics"][mid].get("status"))
     parts, index, appendix = [], [], []  # type: List[str], List[Tuple[str, str, str]], List[str]
     for number, sid in enumerate(order, 1):
@@ -1822,6 +1848,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--to", dest="window_to", help="incident: window end, ISO time")
     p.add_argument("--alarm-id", help="incident: build the window around this alarm instead of --from/--to")
     p.add_argument("--history", type=Path, default=HISTORY_ROOT, help="the alarm archive (default ~/.edgeconnect-mcp/history)")
+    p.add_argument("--parts", help="custom: comma-separated reports to stitch, from: " + ", ".join(CUSTOM_PARTS))
     p.add_argument("--out", type=Path, default=Path("."), help="folder for bundle.json")
     p.add_argument("--dotenv", default=os.environ.get("EDGECONNECT_DOTENV"), help="settings file (default: $EDGECONNECT_DOTENV, else ~/.edgeconnect-mcp/.env, else ./.env)")
     st = sub.add_parser("store", help="keep the Orchestrator's last 7 days of alarms in the local archive (run it daily from cron or launchd)")
@@ -1861,7 +1888,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise ValueError("give either --alarm-id or --from and --to, not both")
             window = (_parse_time(args.window_from), _parse_time(args.window_to)) if args.window_from or args.window_to else None
             bundle = collect(server, args.orchestrator, args.report, args.month, scope, top=args.top, period=args.period, target=args.target, down_tunnels=args.down_tunnels,
-                             window=window, alarm_id=args.alarm_id, history_root=args.history)
+                             window=window, alarm_id=args.alarm_id, history_root=args.history,
+                             parts=[x.strip() for x in args.parts.split(",") if x.strip()] if args.parts else None)
             bundle["sha256"] = hashlib.sha256(json.dumps(bundle, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
             args.out.mkdir(parents=True, exist_ok=True)
             _dump(args.out / "bundle.json", bundle)
