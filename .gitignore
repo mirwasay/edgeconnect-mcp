@@ -27,3 +27,7 @@ docs/superpowers/
 
 # Audit logs written inside the checkout
 *.jsonl
+
+# Preconfig toolkit outputs, when it runs inside this checkout
+preconfig-output/
+preconfig-work/
